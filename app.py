@@ -4,19 +4,14 @@ import numpy as np
 import requests
 import re
 import os
-import shutil
 import time
-import json
 import gzip
-import tarfile
 from pathlib import Path
 from scipy import stats
 from statsmodels.stats.multitest import multipletests
-from bs4 import BeautifulSoup
 import mygene
 from urllib.parse import quote
-import matplotlib.pyplot as plt
-import seaborn as sns
+from collections import Counter
 
 # ==========================================
 # 0. 配置与初始化
@@ -35,8 +30,8 @@ if "geo_hits" not in st.session_state:
     st.session_state["geo_hits"] = pd.DataFrame()
 if "selected_gses" not in st.session_state:
     st.session_state["selected_gses"] = []
-if "final_drug_rank" not in st.session_state:
-    st.session_state["final_drug_rank"] = pd.DataFrame()
+if "metadata_cache" not in st.session_state:
+    st.session_state["metadata_cache"] = {}
 
 # ==========================================
 # 1. 核心工具函数
@@ -103,13 +98,12 @@ def download_file(url, path):
             for chunk in r.iter_content(chunk_size=1024*1024):
                 if chunk: f.write(chunk)
     except Exception as e:
-        if path.exists(): path.unlink() # 删除损坏文件
+        if path.exists(): path.unlink()
         raise e
 
 def get_geo_urls(gse):
     """生成下载链接"""
     gse = gse.strip().upper()
-    # 提取数字部分用于构建目录，例如 GSE12345 -> GSE12nnn
     num = re.findall(r'\d+', gse)
     if not num: return "", ""
     series_id = int(num[0])
@@ -119,59 +113,73 @@ def get_geo_urls(gse):
     matrix_url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{prefix}/{gse}/matrix/{gse}_series_matrix.txt.gz"
     return soft_url, matrix_url
 
-def parse_soft_robust(soft_path, case_terms, ctrl_terms):
+def extract_metadata_only(gse):
     """
-    增强版 Soft 解析：读取 Title, Source, Characteristics, Description
-    返回: (conditions_series, debug_info_dict)
+    只下载并解析 SOFT 文件，用于预览
+    返回: DataFrame (GSM, Title, Full_Text)
     """
-    meta = {}
-    current_gsm = None
+    gse_dir = RAW_DIR / gse
+    gse_dir.mkdir(exist_ok=True)
+    soft_url, _ = get_geo_urls(gse)
+    soft_path = gse_dir / f"{gse}_family.soft.gz"
     
-    # 逐行读取 Soft 文件
+    # 下载
+    try:
+        download_file(soft_url, soft_path)
+    except Exception as e:
+        return None, str(e)
+
+    # 解析
+    meta = []
+    current_gsm = None
+    current_data = {"GSM": "", "Title": "", "Text": []}
+    
     with gzip.open(soft_path, 'rt', encoding='utf-8', errors='ignore') as f:
         for line in f:
             line = line.strip()
             if line.startswith("^SAMPLE ="):
+                if current_gsm:
+                    meta.append({
+                        "GSM": current_data["GSM"],
+                        "Title": current_data["Title"],
+                        "Full_Description": " | ".join(current_data["Text"]).lower()
+                    })
                 current_gsm = line.split("=")[1].strip()
-                meta[current_gsm] = [] # 使用列表存储该样本的所有描述文本
-            elif current_gsm:
-                # 抓取所有可能包含分组信息的字段
-                if line.startswith(("!Sample_title", "!Sample_source_name", "!Sample_characteristics", "!Sample_description")):
-                    try:
-                        content = line.split("=", 1)[1].strip().lower()
-                        meta[current_gsm].append(content)
-                    except:
-                        pass
-
-    conditions = {}
-    debug_info = {} # 用于在界面上展示，帮助用户Debug
-
-    for gsm, texts in meta.items():
-        full_text = " | ".join(texts) # 合并所有信息
-        debug_info[gsm] = full_text   # 保存给用户看
-        
-        # 匹配逻辑
-        hit_case = any(t in full_text for t in case_terms)
-        hit_ctrl = any(t in full_text for t in ctrl_terms)
-        
-        if hit_case and not hit_ctrl:
-            conditions[gsm] = "case"
-        elif hit_ctrl and not hit_case:
-            conditions[gsm] = "control"
-        elif hit_case and hit_ctrl:
-            # 冲突处理：通常 Case 的描述（如 specific mutation）比 Control 更特异
-            # 如果包含 disease/mutation，由于 control 样本也可能提到 disease (e.g. "control for disease X")
-            # 这里保守起见设为 ambiguous，或者你可以偏向 Case
-            conditions[gsm] = "ambiguous"
-        else:
-            conditions[gsm] = "unknown"
+                current_data = {"GSM": current_gsm, "Title": "", "Text": []}
             
-    return pd.Series(conditions), debug_info
+            elif current_gsm:
+                if line.startswith("!Sample_title"):
+                    current_data["Title"] = line.split("=", 1)[1].strip()
+                    current_data["Text"].append(line.split("=", 1)[1].strip())
+                elif line.startswith(("!Sample_source_name", "!Sample_characteristics", "!Sample_description")):
+                    try:
+                        content = line.split("=", 1)[1].strip()
+                        current_data["Text"].append(content)
+                    except: pass
+        
+        # Add last one
+        if current_gsm:
+             meta.append({
+                "GSM": current_data["GSM"],
+                "Title": current_data["Title"],
+                "Full_Description": " | ".join(current_data["Text"]).lower()
+            })
+            
+    return pd.DataFrame(meta), "Success"
+
+def determine_group(text, case_terms, ctrl_terms):
+    text = text.lower()
+    hit_case = any(t in text for t in case_terms)
+    hit_ctrl = any(t in text for t in ctrl_terms)
+    
+    if hit_case and not hit_ctrl: return "Case", "red"
+    if hit_ctrl and not hit_case: return "Control", "green"
+    if hit_case and hit_ctrl: return "Ambiguous (Both)", "orange"
+    return "Unknown", "grey"
 
 # --- 差异分析主流程 ---
 
 def run_analysis_pipeline(gse, case_terms, ctrl_terms):
-    """下载 -> 解析 -> 差异分析"""
     gse_dir = RAW_DIR / gse
     gse_dir.mkdir(exist_ok=True)
     
@@ -179,70 +187,79 @@ def run_analysis_pipeline(gse, case_terms, ctrl_terms):
     soft_path = gse_dir / f"{gse}_family.soft.gz"
     matrix_path = gse_dir / f"{gse}_series_matrix.txt.gz"
     
-    # 1. 下载
+    # 1. 下载 (确保文件都存在)
     try:
         download_file(soft_url, soft_path)
         download_file(matrix_url, matrix_path)
     except Exception as e:
-        return None, f"Download Error: {str(e)}", {}
+        return None, f"Download Error: {str(e)}"
 
-    # 2. 分组解析 (关键步骤)
-    conditions, debug_info = parse_soft_robust(soft_path, case_terms, ctrl_terms)
+    # 2. 复用 metadata 解析逻辑
+    df_meta, msg = extract_metadata_only(gse)
+    if df_meta is None or df_meta.empty:
+        return None, f"Metadata Parse Error: {msg}"
     
-    case_samps = conditions[conditions == "case"].index.tolist()
-    ctrl_samps = conditions[conditions == "control"].index.tolist()
+    # 3. 确定分组
+    conditions = {}
+    for idx, row in df_meta.iterrows():
+        group, _ = determine_group(row["Full_Description"], case_terms, ctrl_terms)
+        if group == "Case": conditions[row["GSM"]] = "case"
+        elif group == "Control": conditions[row["GSM"]] = "control"
     
-    # 如果分组失败，直接返回调试信息
+    case_samps = [k for k,v in conditions.items() if v == "case"]
+    ctrl_samps = [k for k,v in conditions.items() if v == "control"]
+    
     if len(case_samps) == 0 or len(ctrl_samps) == 0:
-        msg = f"Insufficient Samples: Case={len(case_samps)}, Ctrl={len(ctrl_samps)}"
-        return None, msg, debug_info
+        return None, f"Insufficient Samples: Case={len(case_samps)}, Ctrl={len(ctrl_samps)}"
     
-    # 3. 读取矩阵
+    # 4. 读取矩阵
     try:
-        # matrix文件通常 header比较乱，skiprows=... 需要自动判断，这里假设标准格式 !series_matrix_table_begin 下一行是header
-        # 简单处理：直接 read_csv, comment='!'
+        # 更加鲁棒的读取方式
         df = pd.read_csv(matrix_path, sep="\t", comment="!", index_col=0, on_bad_lines='skip')
-        df = df.dropna(how='all')
-        df = df.fillna(0)
+        
+        # 移除全是 NaN 的行/列
+        df = df.dropna(how='all', axis=0)
+        df = df.dropna(how='all', axis=1)
+        
+        # 强制转 numeric，无法转换的变为 NaN
+        df = df.apply(pd.to_numeric, errors='coerce')
+        df = df.dropna(how='any') # 只要有一个样本是NaN，这个基因就扔掉，防止报错
         
         # 简单的数据变换判断
-        if df.max().max() > 50:
+        if not df.empty and df.max().max() > 50:
             df = np.log2(df + 1)
+            
     except Exception as e:
-        return None, f"Matrix Parse Error: {str(e)}", debug_info
+        return None, f"Matrix Parse Error: {str(e)}"
     
     # 对齐
-    # 矩阵列名可能是 GSMxxxxx 也可能是 "GSMxxxxx_sample_name"，做模糊匹配
+    col_map = {} 
     valid_cols = []
-    col_map = {} # Matrix Col -> GSM
     
+    # 尝试匹配列名 (列名可能是 GSM12345 或 "Sample 1 (GSM12345)")
     for col in df.columns:
-        # 尝试提取 col 中的 GSM
-        m = re.search(r'(GSM\d+)', col)
+        m = re.search(r'(GSM\d+)', str(col))
         if m:
             gsm = m.group(1)
-            if gsm in conditions.index:
-                valid_cols.append(col)
+            if gsm in conditions:
                 col_map[col] = gsm
+                valid_cols.append(col)
     
     if len(valid_cols) < 2:
-        return None, f"Column Mismatch: Matrix columns do not match SOFT GSM IDs. Found: {list(df.columns[:5])}", debug_info
+        return None, f"Column Mismatch. Matrix cols: {list(df.columns[:3])}... vs Soft IDs: {list(conditions.keys())[:3]}..."
     
     df = df[valid_cols]
     
-    # 映射回 condition
-    case_cols = [c for c in valid_cols if conditions.get(col_map[c]) == "case"]
-    ctrl_cols = [c for c in valid_cols if conditions.get(col_map[c]) == "control"]
+    case_cols = [c for c in valid_cols if conditions[col_map[c]] == "case"]
+    ctrl_cols = [c for c in valid_cols if conditions[col_map[c]] == "control"]
     
-    if len(case_cols) == 0 or len(ctrl_cols) == 0:
-         return None, f"Aligned Samples Missing: Case={len(case_cols)}, Ctrl={len(ctrl_cols)}", debug_info
+    if len(case_cols) < 1 or len(ctrl_cols) < 1:
+         return None, f"Aligned Samples Missing: Case={len(case_cols)}, Ctrl={len(ctrl_cols)}"
 
-    # 4. 差异分析 (T-test 或 Mean Diff)
+    # 5. 差异分析
     results = []
     use_ttest = len(case_cols) >= 2 and len(ctrl_cols) >= 2
     
-    # 为速度考虑，如果不使用 pydeseq2，这里用 numpy 向量化计算会更快
-    # 这里用 iterrows 虽然慢点但稳健
     for gene, row in df.iterrows():
         case_vals = row[case_cols].values
         ctrl_vals = row[ctrl_cols].values
@@ -251,93 +268,68 @@ def run_analysis_pipeline(gse, case_terms, ctrl_terms):
         p = 1.0
         
         if use_ttest:
-            # 忽略全为0或方差极小的情况
-            if np.std(case_vals) < 1e-6 and np.std(ctrl_vals) < 1e-6:
-                p = 1.0
-            else:
+            if np.std(case_vals) > 1e-9 and np.std(ctrl_vals) > 1e-9:
                 try:
                     _, p = stats.ttest_ind(case_vals, ctrl_vals, equal_var=False)
-                except:
-                    p = 1.0
+                except: pass
         
         results.append({"gene": gene, "log2fc": diff, "pval": p})
         
     res_df = pd.DataFrame(results)
-    if res_df.empty: return None, "No valid DE results", debug_info
+    if res_df.empty: return None, "No valid DE results (dataframe empty)"
     
-    # FDR 校正
     res_df["pval"] = res_df["pval"].fillna(1.0)
     res_df["padj"] = multipletests(res_df["pval"], method="fdr_bh")[1]
-    res_df = res_df.sort_values("log2fc", key=abs, ascending=False) # 按 LogFC 绝对值排序
+    res_df = res_df.sort_values("log2fc", key=abs, ascending=False)
     
-    # 提取基因名 (去除 /// 或 ID)
+    # 提取基因名
     res_df["gene_symbol"] = res_df["gene"].apply(lambda x: str(x).split("//")[0].split(".")[0].strip().upper())
     
-    return res_df, f"Success: Case={len(case_cols)}, Ctrl={len(ctrl_cols)}", debug_info
+    return res_df, f"Success: Case={len(case_cols)}, Ctrl={len(ctrl_cols)}"
 
 # --- Connectivity API ---
 
 def run_l1000fwd(up_genes, dn_genes):
     url = "https://maayanlab.cloud/l1000fwd/sig_search"
-    # L1000FWD 对基因数量有限制，且必须是大写 Symbol
     payload = {"up_genes": up_genes[:150], "down_genes": dn_genes[:150]}
     try:
         r = requests.post(url, json=payload, timeout=30)
         res_id = r.json().get("result_id")
         if not res_id: return pd.DataFrame()
-        
         time.sleep(1)
         r2 = requests.get(f"https://maayanlab.cloud/l1000fwd/result/topn/{res_id}", timeout=30)
         data = r2.json()
-        
         rows = []
-        # 我们主要关注 'opposite' (反转 gene signature 的药物)
         if "opposite" in data:
             for item in data["opposite"]:
                 rows.append({
-                    "drug": item.get("pert_id"), # L1000FWD 返回的是 ID 或 Name
+                    "drug": item.get("pert_id"),
                     "score": item.get("score"),
                     "source": "L1000FWD",
                     "direction": "opposite"
                 })
         return pd.DataFrame(rows)
-    except Exception as e:
-        print(f"L1000FWD Error: {e}")
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 def run_enrichr(genes, library="LINCS_L1000_Chem_Pert_down"):
     base = "https://maayanlab.cloud/Enrichr"
     try:
-        # 1. Add List
-        r = requests.post(f"{base}/addList", files={
-            'list': (None, '\n'.join(genes[:300])),
-            'description': (None, 'Streamlit_Pipeline')
-        }, timeout=30)
+        r = requests.post(f"{base}/addList", files={'list': (None, '\n'.join(genes[:300])), 'description': (None, 'Streamlit')}, timeout=30)
         user_list_id = r.json().get("userListId")
         if not user_list_id: return pd.DataFrame()
-        
-        # 2. Enrich
         r2 = requests.get(f"{base}/enrich?userListId={user_list_id}&backgroundType={library}", timeout=30)
         data = r2.json()
         if library not in data: return pd.DataFrame()
-        
         rows = []
         for item in data[library]:
-            # Enrichr 结果格式: [Rank, Term, P-value, Z-score, Combined Score, ...]
-            # Term 通常是 "DrugName_CellLine_..."
-            term = item[1]
-            drug_name = term.split("_")[0].split(" ")[0] # 简单清洗
-            
             rows.append({
-                "drug": drug_name,
-                "score": item[4], # Combined Score
+                "drug": item[1].split("_")[0].split(" ")[0],
+                "score": item[4],
                 "pval": item[2],
                 "source": "Enrichr"
             })
         return pd.DataFrame(rows)
-    except Exception as e:
-        print(f"Enrichr Error: {e}")
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 # ==========================================
 # 2. Streamlit 界面逻辑
@@ -345,202 +337,185 @@ def run_enrichr(genes, library="LINCS_L1000_Chem_Pert_down"):
 
 # --- Sidebar ---
 with st.sidebar:
-    st.header("⚙️ 参数设置")
-    taxon_filter = st.selectbox("物种过滤", ["Homo sapiens", "Mus musculus", "All"], index=0)
+    st.header("⚙️ 全局分组设置")
+    st.info("💡 提示：请先在右侧 '🔬 样本调试器' 中找到数据集中使用的特定词汇，然后复制到这里。")
     
-    st.divider()
-    st.markdown("### 🏷️ 分组关键词 (关键)")
-    st.info("如果找不到样本，请在这里添加样本描述中出现的词。")
-    
-    # 针对你之前 CLCN / Cystic Fibrosis 优化的默认关键词
     default_case = "mutation, mutant, variant, patient, knockout, knockdown, disease, clcn, cf, cystic fibrosis, tumor, cancer, treated, stimulation, infected"
     default_ctrl = "control, wt, wild type, wild-type, healthy, normal, vehicle, pbs, dmso, mock, baseline, untreated, placebo, non-targeting"
     
-    case_input = st.text_area("实验组 (Case) 关键词", default_case, height=100)
-    ctrl_input = st.text_area("对照组 (Control) 关键词", default_ctrl, height=100)
+    case_input = st.text_area("Case (实验组) 关键词", default_case, height=120)
+    ctrl_input = st.text_area("Control (对照组) 关键词", default_ctrl, height=120)
     
     case_terms = [x.strip().lower() for x in case_input.split(",") if x.strip()]
     ctrl_terms = [x.strip().lower() for x in ctrl_input.split(",") if x.strip()]
     
     st.divider()
-    top_n_genes = st.number_input("Signature 基因数量 (Top N)", 50, 500, 150)
-    st.caption("提取多少个差异基因用于药物预测")
+    top_n_genes = st.number_input("Signature Top N", 50, 500, 150)
+    taxon_filter = st.selectbox("物种", ["Homo sapiens", "Mus musculus", "All"], index=0)
 
 # --- Main Tabs ---
-tab1, tab2, tab3 = st.tabs(["1️⃣ 搜索 & 选择", "2️⃣ 运行批处理", "3️⃣ 结果看板"])
+tab1, tab2, tab3, tab4 = st.tabs(["1️⃣ 搜索数据集", "2️⃣ 🔬 样本分组调试器", "3️⃣ ⚡ 运行分析", "4️⃣ 📊 结果看板"])
 
 # --- Tab 1: Search ---
 with tab1:
-    st.subheader("🔍 搜索 GEO 数据集")
     col1, col2 = st.columns([3, 1])
     with col1:
-        query_text = st.text_input("输入查询", value='(CLCN2 OR "chloride channel 2") AND (mutation OR knockout) AND "RNA-seq"')
+        query_text = st.text_input("GEO Search Query", value='(CLCN2 OR "chloride channel 2") AND (mutation OR knockout) AND "RNA-seq"')
     with col2:
-        search_btn = st.button("开始搜索", use_container_width=True)
-    
-    if search_btn and query_text:
-        with st.spinner("正在连接 NCBI..."):
-            df_hits = geo_search(query_text)
-            if not df_hits.empty:
-                if taxon_filter != "All":
-                    df_hits = df_hits[df_hits["Taxon"] == taxon_filter]
-                st.session_state["geo_hits"] = df_hits
-            else:
-                st.warning("未找到结果，请放宽关键词或检查网络。")
-    
-    if not st.session_state["geo_hits"].empty:
-        st.write(f"找到 {len(st.session_state['geo_hits'])} 个数据集 (请勾选要分析的):")
-        
-        # 使用 DataEditor 选择
-        hits_display = st.session_state["geo_hits"].copy()
-        hits_display.insert(0, "Select", False)
-        
-        edited_df = st.data_editor(
-            hits_display,
-            column_config={"Select": st.column_config.CheckboxColumn(required=True)},
-            disabled=["Accession", "Title", "Summary", "Taxon", "Samples", "Date"],
-            use_container_width=True,
-            hide_index=True
-        )
-        
-        selected = edited_df[edited_df["Select"]]["Accession"].tolist()
-        st.session_state["selected_gses"] = selected
-        
-        if selected:
-            st.success(f"已选择 {len(selected)} 个数据集: {', '.join(selected)}")
-            st.info("👉 请前往 '2️⃣ 运行批处理' 标签页开始分析")
-    else:
-        st.write("暂无数据。")
+        if st.button("开始搜索", use_container_width=True):
+            with st.spinner("Searching NCBI..."):
+                df = geo_search(query_text)
+                if not df.empty and taxon_filter != "All":
+                    df = df[df["Taxon"] == taxon_filter]
+                st.session_state["geo_hits"] = df
 
-# --- Tab 2: Run ---
+    if not st.session_state["geo_hits"].empty:
+        st.write(f"Found {len(st.session_state['geo_hits'])} datasets:")
+        # Data Editor
+        hits = st.session_state["geo_hits"].copy()
+        hits.insert(0, "Select", False)
+        edited = st.data_editor(hits, column_config={"Select": st.column_config.CheckboxColumn(required=True)}, disabled=["Accession", "Title"], use_container_width=True, hide_index=True)
+        st.session_state["selected_gses"] = edited[edited["Select"]]["Accession"].tolist()
+        if st.session_state["selected_gses"]:
+            st.success(f"已选择: {st.session_state['selected_gses']} (请前往 Tab 2 预览分组)")
+
+# --- Tab 2: Metadata Inspector (New!) ---
 with tab2:
-    st.subheader("⚡ 自动化分析 Pipeline")
+    st.subheader("🔬 样本元数据深度预览 & 关键词提取")
+    st.markdown("在这里检查你的关键词是否能正确匹配样本。**先解决 'Unknown' 和 'Case=0/Ctrl=0' 的问题，再运行 Pipeline。**")
     
     if not st.session_state["selected_gses"]:
-        st.warning("⚠️ 请先在第 1 步选择至少一个数据集。")
+        st.warning("请先在 Tab 1 选择数据集。")
     else:
-        st.markdown(f"**待分析列表**: {', '.join(st.session_state['selected_gses'])}")
+        # Selector
+        inspect_gse = st.selectbox("选择要调试的数据集:", st.session_state["selected_gses"])
         
-        if st.button("🚀 启动分析 (Start Pipeline)", type="primary"):
-            results_bucket = []
-            log_area = st.container()
-            progress_bar = st.progress(0)
+        if st.button(f"🔍 获取 {inspect_gse} 的元数据"):
+            with st.spinner("正在下载描述文件 (不下载矩阵)..."):
+                df_meta, msg = extract_metadata_only(inspect_gse)
+                if df_meta is not None:
+                    st.session_state["metadata_cache"][inspect_gse] = df_meta
+                    st.success("元数据加载成功！")
+                else:
+                    st.error(f"加载失败: {msg}")
+        
+        # Display Logic
+        if inspect_gse in st.session_state["metadata_cache"]:
+            df_display = st.session_state["metadata_cache"][inspect_gse].copy()
             
-            total = len(st.session_state["selected_gses"])
+            # 实时计算分组状态
+            df_display["Predicted Group"] = df_display["Full_Description"].apply(
+                lambda x: determine_group(x, case_terms, ctrl_terms)[0]
+            )
             
-            for i, gse in enumerate(st.session_state["selected_gses"]):
-                with log_area:
-                    st.write(f"--- 处理中: **{gse}** ({i+1}/{total}) ---")
-                    
-                    # 1. 差异分析
-                    df_de, msg, debug_info = run_analysis_pipeline(gse, case_terms, ctrl_terms)
-                    
-                    if df_de is None:
-                        st.error(f"❌ {gse} 失败: {msg}")
-                        # === DEBUG 关键点 ===
-                        with st.expander(f"🕵️‍♂️ 调试: {gse} 的样本元数据 (为什么没匹配到?)"):
-                            st.caption("系统读取到的样本描述如下。请检查这些文本，找出代表 Case/Control 的特定词汇，并添加到左侧设置栏。")
-                            # 只显示前 15 个样本，避免太长
-                            preview_keys = list(debug_info.keys())[:15]
-                            st.json({k: debug_info[k] for k in preview_keys})
-                        continue
-                    
-                    st.success(f"✅ {gse} 差异分析完成: {msg}")
-                    
-                    # 2. 提取 Signature
-                    # 只有 LogFC 大的才算 Up，小的才算 Down
-                    up_genes = df_de[df_de["log2fc"] > 0].head(top_n_genes)["gene_symbol"].tolist()
-                    dn_genes = df_de[df_de["log2fc"] < 0].tail(top_n_genes)["gene_symbol"].tolist()
-                    
-                    up_genes = clean_gene_list(up_genes)
-                    dn_genes = clean_gene_list(dn_genes)
-                    
-                    if len(up_genes) < 10 or len(dn_genes) < 10:
-                        st.warning(f"⚠️ {gse}: 差异基因过少 (Up={len(up_genes)}, Down={len(dn_genes)})，跳过药物预测。")
-                        continue
-                        
-                    # 3. 药物预测 API
-                    st.text(f"正在查询 L1000FWD 和 Enrichr...")
-                    
-                    # L1000FWD (找反转)
-                    df_l1000 = run_l1000fwd(up_genes, dn_genes)
-                    
-                    # Enrichr (UP genes vs Drug Down) -> Reversal
-                    df_enrichr = run_enrichr(up_genes, library="LINCS_L1000_Chem_Pert_down")
-                    # Enrichr (Down genes vs Drug Up) -> Reversal (Optional, add if needed)
-                    
-                    # 合并
-                    parts = []
-                    if not df_l1000.empty: parts.append(df_l1000)
-                    if not df_enrichr.empty: parts.append(df_enrichr)
-                    
-                    if parts:
-                        combined = pd.concat(parts)
-                        combined["gse"] = gse
-                        results_bucket.append(combined)
-                        with st.expander(f"💊 {gse} 预测到的 Top 药物"):
-                            st.dataframe(combined.head(5))
-                    else:
-                        st.warning(f"{gse}: API 未返回有效药物结果。")
-                
-                progress_bar.progress((i + 1) / total)
+            # 统计
+            counts = df_display["Predicted Group"].value_counts()
+            c_case = counts.get("Case", 0)
+            c_ctrl = counts.get("Control", 0)
+            c_unk = counts.get("Unknown", 0)
             
-            st.success("🎉 所有任务处理完毕！请查看 '3️⃣ 结果看板'")
-            if results_bucket:
-                st.session_state["final_drug_rank"] = pd.concat(results_bucket)
+            # Metrics
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Samples", len(df_display))
+            m1.metric("Dataset", inspect_gse)
+            m2.metric("✅ Matched Case", c_case)
+            m3.metric("✅ Matched Control", c_ctrl)
+            m4.metric("❌ Unknown", c_unk, delta_color="inverse")
+            
+            if c_case == 0 or c_ctrl == 0:
+                st.error("⚠️ 警告: 缺少实验组或对照组！请从下表中寻找关键词并添加到左侧侧边栏。")
             else:
-                st.session_state["final_drug_rank"] = pd.DataFrame()
+                st.success("状态良好，可以进行分析。")
+            
+            # 自动提取关键词建议
+            all_text = " ".join(df_display["Full_Description"].tolist()).lower()
+            # 简单分词，去掉常用词
+            words = re.findall(r'\b[a-z]{3,}\b', all_text)
+            common_stops = set(["the","and","for","with","from","sample","rna","seq","homo","sapiens","mus","musculus","extraction","total","analysis","description","characteristics","source","name","title","geo","accession","platform","organism","instrument","model","library","strategy","layout"])
+            filtered_words = [w for w in words if w not in common_stops and w not in case_terms and w not in ctrl_terms]
+            most_common = Counter(filtered_words).most_common(20)
+            
+            with st.expander("💡 关键词推荐 (点击复制到侧边栏)"):
+                st.write("以下是元数据中出现频率最高、且不在你当前列表中的词汇。如果看到具体的疾病名或药物名，请手动添加到左侧。")
+                st.code(", ".join([f"{w[0]}" for w in most_common]), language="text")
 
-# --- Tab 3: Results ---
-with tab3:
-    st.subheader("💊 药物汇总与排序")
-    
-    res = st.session_state.get("final_drug_rank", pd.DataFrame())
-    
-    if not res.empty:
-        # 清洗药名 (转小写，去除非法字符)
-        res["drug_clean"] = res["drug"].astype(str).str.lower().str.strip()
-        # 去掉 BRD-xxxx 这种内部ID，如果太短的通常不是好药名
-        res = res[res["drug_clean"].str.len() > 2]
-        
-        # 聚合统计
-        agg_df = res.groupby("drug_clean").agg(
-            Frequency=('gse', 'nunique'),         # 在多少个 GSE 中出现
-            Total_Score=('score', 'sum'),         # 总分 (仅供参考，不同源分数不可直接加)
-            Sources=('source', lambda x: ", ".join(sorted(set(x)))),
-            Support_GSEs=('gse', lambda x: ", ".join(sorted(set(x))))
-        ).reset_index()
-        
-        # 排序：优先按出现频率，其次按总分
-        agg_df = agg_df.sort_values(["Frequency", "Total_Score"], ascending=[False, False])
-        agg_df.columns = ["Drug Name", "GSE Count", "Sum Score", "Sources", "GSE IDs"]
-        
-        # 展示 Top 结果
-        col_view, col_stat = st.columns([3, 1])
-        
-        with col_view:
-            st.markdown("### 🏆 Top 候选药物列表")
+            # 主表格
+            def color_row(row):
+                grp = row["Predicted Group"]
+                if grp == "Case": return ['background-color: #ffe6e6'] * len(row)
+                if grp == "Control": return ['background-color: #e6ffe6'] * len(row)
+                if grp == "Unknown": return ['background-color: #f0f0f0'] * len(row)
+                return [''] * len(row)
+
             st.dataframe(
-                agg_df.style.background_gradient(subset=["GSE Count"], cmap="Greens"),
+                df_display.style.apply(color_row, axis=1),
+                column_config={
+                    "Full_Description": st.column_config.TextColumn("Sample Description", width="large"),
+                    "Predicted Group": st.column_config.TextColumn("Current Status", width="medium")
+                },
                 use_container_width=True,
-                height=600
+                height=500
             )
+
+# --- Tab 3: Run ---
+with tab3:
+    st.subheader("⚡ 批处理分析")
+    
+    if st.button("🚀 启动分析 (Start Pipeline)", type="primary"):
+        results_bucket = []
+        log_container = st.container()
+        progress = st.progress(0)
         
-        with col_stat:
-            st.markdown("### 📊 统计")
-            st.metric("总药物数", len(agg_df))
-            st.metric("高置信度 (>1 GSE)", len(agg_df[agg_df["GSE Count"] > 1]))
+        for i, gse in enumerate(st.session_state["selected_gses"]):
+            with log_container:
+                st.write(f"**Processing {gse} ({i+1}/{len(st.session_state['selected_gses'])})**...")
+                
+                df_de, msg = run_analysis_pipeline(gse, case_terms, ctrl_terms)
+                
+                if df_de is None:
+                    st.error(f"❌ {gse} Failed: {msg}")
+                    continue
+                
+                st.success(f"✅ {gse} DE Done. Genes: {len(df_de)}")
+                
+                # Signature
+                up = df_de[df_de["log2fc"] > 0].head(top_n_genes)["gene_symbol"].tolist()
+                dn = df_de[df_de["log2fc"] < 0].tail(top_n_genes)["gene_symbol"].tolist()
+                
+                if len(up) < 5 or len(dn) < 5:
+                    st.warning(f"Not enough DE genes for {gse}")
+                    continue
+                
+                # API
+                df_l = run_l1000fwd(clean_gene_list(up), clean_gene_list(dn))
+                df_e = run_enrichr(clean_gene_list(up), "LINCS_L1000_Chem_Pert_down")
+                
+                comb = pd.concat([df_l, df_e])
+                if not comb.empty:
+                    comb["gse"] = gse
+                    results_bucket.append(comb)
             
-            st.download_button(
-                "📥 下载完整 CSV",
-                data=agg_df.to_csv(index=False).encode("utf-8"),
-                file_name="drug_repurposing_final_rank.csv",
-                mime="text/csv",
-                type="primary"
-            )
-            
-            st.markdown("---")
-            st.info("提示: GSE Count 越高，代表该药物在多个独立数据集中均显示出对疾病特征的反转作用，可靠性越高。")
-            
+            progress.progress((i+1)/len(st.session_state["selected_gses"]))
+        
+        if results_bucket:
+            st.session_state["final_drug_rank"] = pd.concat(results_bucket)
+            st.success("Pipeline Finished! Check Tab 4.")
+        else:
+            st.warning("No drugs found.")
+
+# --- Tab 4: Results ---
+with tab4:
+    res = st.session_state.get("final_drug_rank", pd.DataFrame())
+    if not res.empty:
+        res["drug_clean"] = res["drug"].astype(str).str.lower().str.strip()
+        agg = res.groupby("drug_clean").agg(
+            Count=('gse', 'nunique'),
+            Score_Sum=('score', 'sum'),
+            GSEs=('gse', lambda x: ",".join(set(x))),
+            Sources=('source', lambda x: ",".join(set(x)))
+        ).reset_index().sort_values(["Count", "Score_Sum"], ascending=[False, False])
+        
+        st.dataframe(agg, use_container_width=True)
+        st.download_button("Download CSV", agg.to_csv().encode("utf-8"), "drugs.csv")
     else:
-        st.info("暂无结果。请先运行 Pipeline，并确保至少有一个数据集成功跑通。")
+        st.info("No results yet.")
