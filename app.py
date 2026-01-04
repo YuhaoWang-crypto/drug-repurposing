@@ -106,10 +106,14 @@ def get_geo_urls(gse):
     return soft_url, matrix_url
 
 def extract_metadata_only(gse):
+    """
+    只下载并解析 SOFT 文件，用于预览
+    """
     gse_dir = RAW_DIR / gse
     gse_dir.mkdir(exist_ok=True)
     soft_url, _ = get_geo_urls(gse)
     soft_path = gse_dir / f"{gse}_family.soft.gz"
+    
     try:
         download_file(soft_url, soft_path)
     except Exception as e:
@@ -131,6 +135,7 @@ def extract_metadata_only(gse):
                     })
                 current_gsm = line.split("=")[1].strip()
                 current_data = {"GSM": current_gsm, "Title": "", "Text": []}
+            
             elif current_gsm:
                 if line.startswith("!Sample_title"):
                     current_data["Title"] = line.split("=", 1)[1].strip()
@@ -140,12 +145,14 @@ def extract_metadata_only(gse):
                         content = line.split("=", 1)[1].strip()
                         current_data["Text"].append(content)
                     except: pass
+        
         if current_gsm:
              meta.append({
                 "GSM": current_data["GSM"],
                 "Title": current_data["Title"],
                 "Full_Description": " | ".join(current_data["Text"]).lower()
             })
+            
     return pd.DataFrame(meta), "Success"
 
 def determine_group(text, case_terms, ctrl_terms):
@@ -153,62 +160,78 @@ def determine_group(text, case_terms, ctrl_terms):
     hit_case = any(t in text for t in case_terms)
     hit_ctrl = any(t in text for t in ctrl_terms)
     
-    # === 冲突优先 Control ===
+    # 冲突优先判定为 Control
     if hit_case and hit_ctrl:
-        return "Control", "#e6ffe6" # Green
+        return "Control", "#e6ffe6"
     
-    if hit_case: return "Case", "#ffe6e6" # Red
-    if hit_ctrl: return "Control", "#e6ffe6" # Green
+    if hit_case: return "Case", "#ffe6e6"
+    if hit_ctrl: return "Control", "#e6ffe6"
     
     return "Unknown", "grey"
 
-# --- 关键：智能矩阵读取器 ---
+# --- 核心修复：超强鲁棒性的矩阵读取 ---
 def smart_load_matrix(path):
     """
-    智能查找表头行，解决 !Sample_title 被当做注释过滤的问题
+    读取 Matrix，自动寻找 Header，并清洗列名（去除引号、空格）
     """
     header_row = None
-    # 1. 扫描前1000行，寻找包含多个 GSM 的行
+    
+    # 1. 扫描寻找起始位
     with gzip.open(path, 'rt', encoding='utf-8', errors='ignore') as f:
         for i, line in enumerate(f):
-            if i > 1000: break
-            # 如果一行里包含 >1 个 "GSM"，很可能是表头
-            if line.count("GSM") > 1:
+            if i > 2000: break
+            # 官方标准标记
+            if "!series_matrix_table_begin" in line:
+                header_row = i + 1
+                break
+            # 或者找 ID_REF
+            if line.startswith("\"ID_REF\"") or line.startswith("ID_REF"):
                 header_row = i
                 break
     
+    # 如果没找到标准标记，回退到找 GSM 出现最多的行
     if header_row is None:
-        # 兜底：假设它是 ID_REF 开头
         with gzip.open(path, 'rt', encoding='utf-8', errors='ignore') as f:
+            max_gsm_count = 0
             for i, line in enumerate(f):
                 if i > 1000: break
-                if "ID_REF" in line or "id_ref" in line:
+                c = line.count("GSM")
+                if c > max_gsm_count and c > 1:
+                    max_gsm_count = c
                     header_row = i
-                    break
     
     # 2. 读取
     try:
-        if header_row is not None:
-            # 找到了表头，跳过前面的行
-            df = pd.read_csv(path, sep="\t", skiprows=header_row, index_col=0, on_bad_lines='skip')
-        else:
-            # 没找到，尝试盲读（不要 comment='!'，否则会丢数据）
-            df = pd.read_csv(path, sep="\t", comment=None, index_col=0, on_bad_lines='skip')
-            
-        # 3. 清洗
-        # 删除所有列名不是 GSM 的列
-        gsm_cols = [c for c in df.columns if "GSM" in str(c)]
-        if not gsm_cols:
-             # 有时候列名是 "Sample 1 (GSM123)"
-             gsm_cols = [c for c in df.columns if re.search(r'GSM\d+', str(c))]
+        # 如果 header_row 还是 None，说明文件太奇怪，尝试默认读取
+        skip = header_row if header_row is not None else "infer"
         
-        df = df[gsm_cols]
-        # 提取纯 GSM ID 作为列名
-        new_cols = []
-        for c in df.columns:
-            m = re.search(r'(GSM\d+)', str(c))
-            new_cols.append(m.group(1) if m else str(c))
-        df.columns = new_cols
+        if skip == "infer":
+            df = pd.read_csv(path, sep="\t", comment="!", index_col=0, on_bad_lines='skip')
+        else:
+            df = pd.read_csv(path, sep="\t", skiprows=skip, index_col=0, on_bad_lines='skip')
+            
+        # 3. 终极清洗列名 (解决 Mismatch 的核心)
+        # 有时候列名是 "GSM123"，有时候是 GSM123，有时候是 "Sample 1 (GSM123)"
+        cleaned_columns = {}
+        for col in df.columns:
+            # 强制转字符串，去除首尾空格
+            s_col = str(col).strip().replace('"', '').replace("'", "")
+            # 提取 GSM ID
+            m = re.search(r'(GSM\d+)', s_col)
+            if m:
+                cleaned_columns[col] = m.group(1) # Map: Original -> GSM12345
+        
+        # 只保留能提取出 GSM 的列
+        if not cleaned_columns:
+            # 如果没提取到，可能这一行不是真正的 Header，或者列名里没有 GSM
+            raise ValueError(f"No GSM IDs found in columns: {list(df.columns[:5])}")
+            
+        df = df.rename(columns=cleaned_columns)
+        # 只保留在清洗列表里的列
+        df = df[list(cleaned_columns.values())]
+        
+        # 移除重复列 (保留第一个)
+        df = df.loc[:, ~df.columns.duplicated()]
         
         # 强制转数字
         df = df.apply(pd.to_numeric, errors='coerce')
@@ -235,70 +258,71 @@ def run_analysis_pipeline(gse, case_terms, ctrl_terms):
     except Exception as e:
         return None, f"Download Error: {str(e)}"
 
-    # 2. 分组解析
+    # 2. 分组解析 (从 Soft 文件)
     df_meta, msg = extract_metadata_only(gse)
     if df_meta is None or df_meta.empty:
         return None, f"Metadata Parse Error: {msg}"
     
     conditions = {}
     for idx, row in df_meta.iterrows():
+        # 确保 GSM ID 是干净的
+        clean_gsm = str(row["GSM"]).strip()
         group, _ = determine_group(row["Full_Description"], case_terms, ctrl_terms)
-        if group == "Case": conditions[row["GSM"]] = "case"
-        elif group == "Control": conditions[row["GSM"]] = "control"
+        if group == "Case": conditions[clean_gsm] = "case"
+        elif group == "Control": conditions[clean_gsm] = "control"
     
-    case_samps = [k for k,v in conditions.items() if v == "case"]
-    ctrl_samps = [k for k,v in conditions.items() if v == "control"]
-    
-    if len(case_samps) == 0 or len(ctrl_samps) == 0:
-        return None, f"Insufficient Samples: Case={len(case_samps)}, Ctrl={len(ctrl_samps)}"
-    
-    # 3. 智能读取矩阵
+    # 3. 读取矩阵 (使用新的智能加载器)
     try:
         df = smart_load_matrix(matrix_path)
-        
         if not df.empty and df.max().max() > 50:
             df = np.log2(df + 1)
-            
     except Exception as e:
         return None, f"Matrix Parse Error: {str(e)}"
     
-    # 对齐
-    valid_cols = [c for c in df.columns if c in conditions]
+    # 4. 对齐 (Intersection)
+    # 取交集
+    matrix_gsms = set(df.columns)
+    soft_gsms = set(conditions.keys())
+    common_gsms = list(matrix_gsms.intersection(soft_gsms))
     
-    if len(valid_cols) < 2:
-        return None, f"Column Mismatch. Matrix GSMs: {list(df.columns[:3])}... vs Soft GSMs: {list(conditions.keys())[:3]}..."
+    if len(common_gsms) < 2:
+        return None, f"Column Mismatch. Matrix has {len(matrix_gsms)} cols, Soft has {len(soft_gsms)} samples. Intersection: {len(common_gsms)}. (Matrix sample: {list(matrix_gsms)[:3]})"
     
-    df = df[valid_cols]
+    # 只保留对齐的列
+    df = df[common_gsms]
     
-    case_cols = [c for c in valid_cols if conditions[c] == "case"]
-    ctrl_cols = [c for c in valid_cols if conditions[c] == "control"]
+    case_cols = [c for c in common_gsms if conditions[c] == "case"]
+    ctrl_cols = [c for c in common_gsms if conditions[c] == "control"]
     
     if len(case_cols) < 1 or len(ctrl_cols) < 1:
          return None, f"Aligned Samples Missing: Case={len(case_cols)}, Ctrl={len(ctrl_cols)}"
 
-    # 4. 差异分析
+    # 5. 差异分析
     results = []
     use_ttest = len(case_cols) >= 2 and len(ctrl_cols) >= 2
     
-    for gene, row in df.iterrows():
-        case_vals = row[case_cols].values
-        ctrl_vals = row[ctrl_cols].values
-        
-        diff = np.mean(case_vals) - np.mean(ctrl_vals)
-        p = 1.0
-        
-        if use_ttest:
-            if np.std(case_vals) > 1e-9 and np.std(ctrl_vals) > 1e-9:
-                try:
-                    _, p = stats.ttest_ind(case_vals, ctrl_vals, equal_var=False)
-                except: pass
-        
-        results.append({"gene": gene, "log2fc": diff, "pval": p})
-        
-    res_df = pd.DataFrame(results)
+    # Numpy 加速
+    case_vals = df[case_cols].values
+    ctrl_vals = df[ctrl_cols].values
+    
+    # 均值差
+    log2fc = np.nanmean(case_vals, axis=1) - np.nanmean(ctrl_vals, axis=1)
+    
+    pvals = np.ones(len(df))
+    if use_ttest:
+        # 简单 T-test，忽略警告
+        with np.errstate(divide='ignore', invalid='ignore'):
+            _, pvals = stats.ttest_ind(case_vals, ctrl_vals, axis=1, equal_var=False)
+    
+    res_df = pd.DataFrame({
+        "gene": df.index,
+        "log2fc": log2fc,
+        "pval": np.nan_to_num(pvals, nan=1.0)
+    })
+    
+    res_df = res_df.dropna(subset=["log2fc"])
     if res_df.empty: return None, "No valid DE results"
     
-    res_df["pval"] = res_df["pval"].fillna(1.0)
     res_df["padj"] = multipletests(res_df["pval"], method="fdr_bh")[1]
     res_df = res_df.sort_values("log2fc", key=abs, ascending=False)
     
@@ -344,6 +368,7 @@ def run_enrichr(genes, library="LINCS_L1000_Chem_Pert_down"):
 # 2. UI
 # ==========================================
 
+# --- Sidebar ---
 with st.sidebar:
     st.header("⚙️ 全局设置")
     st.info("💡 优先 Control: 如果样本同时包含 Case 和 Control 词汇，将强制判定为 Control。")
@@ -361,6 +386,7 @@ with st.sidebar:
     top_n_genes = st.number_input("Top Genes", 50, 500, 150)
     taxon_filter = st.selectbox("Species", ["Homo sapiens", "Mus musculus", "All"], index=0)
 
+# --- Tabs ---
 tab1, tab2, tab3, tab4 = st.tabs(["1️⃣ 搜索数据集", "2️⃣ 🔬 样本分组调试器", "3️⃣ ⚡ 运行分析", "4️⃣ 📊 结果看板"])
 
 with tab1:
@@ -381,6 +407,7 @@ with tab1:
         st.session_state["selected_gses"] = edited[edited["Select"]]["Accession"].tolist()
         if st.session_state["selected_gses"]: st.success(f"Selected: {st.session_state['selected_gses']}")
 
+# --- Tab 2: 恢复了关键词推荐 ---
 with tab2:
     st.subheader("🔬 样本元数据调试")
     if not st.session_state["selected_gses"]:
@@ -396,12 +423,23 @@ with tab2:
             df_display = st.session_state["metadata_cache"][inspect_gse].copy()
             df_display["Group"] = df_display["Full_Description"].apply(lambda x: determine_group(x, case_terms, ctrl_terms)[0])
             
-            # Colors
             def color_row(row):
                 c = {"Case":'background-color:#ffe6e6', "Control":'background-color:#e6ffe6', "Unknown":'background-color:#f0f0f0'}
                 return [c.get(row["Group"], "")] * len(row)
 
             st.dataframe(df_display.style.apply(color_row, axis=1), use_container_width=True)
+            
+            # --- 恢复的部分：关键词推荐 ---
+            st.divider()
+            with st.expander("💡 关键词推荐 (基于词频统计)"):
+                st.write("以下是描述中最常出现的词汇，可用于优化分组：")
+                all_text = " ".join(df_display["Full_Description"].astype(str).tolist()).lower()
+                # 简单分词清洗
+                words = re.findall(r'\b[a-z]{3,}\b', all_text)
+                stops = set(["the","and","for","with","sample","total","rna","homo","sapiens","description","characteristics","source","protocol","extraction","library","sequencing"])
+                clean_words = [w for w in words if w not in stops and w not in case_terms and w not in ctrl_terms]
+                common = Counter(clean_words).most_common(20)
+                st.code(", ".join([f"{w[0]}" for w in common]), language="text")
 
 with tab3:
     st.subheader("⚡ 批处理分析")
