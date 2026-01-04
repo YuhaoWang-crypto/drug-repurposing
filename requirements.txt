@@ -10,3 +10,14 @@ statsmodels
 networkx
 matplotlib
 seaborn
+
+streamlit>=1.36
+pandas>=2.1
+numpy>=1.24
+requests>=2.31
+tqdm>=4.66
+python-dateutil>=2.9
+scipy>=1.10
+statsmodels>=0.14
+networkx>=3.2
+mygene>=3.2.2
