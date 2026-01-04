@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+scipy
+requests
+beautifulsoup4
+lxml
+mygene
+statsmodels
+networkx
+matplotlib
+seaborn
