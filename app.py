@@ -167,15 +167,37 @@ def extract_metadata_only(gse):
             
     return pd.DataFrame(meta), "Success"
 
+# def determine_group(text, case_terms, ctrl_terms):
+#     text = text.lower()
+#     hit_case = any(t in text for t in case_terms)
+#     hit_ctrl = any(t in text for t in ctrl_terms)
+    
+#     if hit_case and not hit_ctrl: return "Case", "red"
+#     if hit_ctrl and not hit_case: return "Control", "green"
+#     if hit_case and hit_ctrl: return "Ambiguous (Both)", "orange"
+#     return "Unknown", "grey"
+
+
+
 def determine_group(text, case_terms, ctrl_terms):
     text = text.lower()
     hit_case = any(t in text for t in case_terms)
     hit_ctrl = any(t in text for t in ctrl_terms)
     
-    if hit_case and not hit_ctrl: return "Case", "red"
-    if hit_ctrl and not hit_case: return "Control", "green"
-    if hit_case and hit_ctrl: return "Ambiguous (Both)", "orange"
+    # === 修改开始：冲突处理逻辑 ===
+    if hit_case and hit_ctrl:
+        # 这里的逻辑是：如果一个样本既说自己是 mutation 又说自己是 control
+        # 通常它是对照组（例如 "Control sample from mutation patient"）
+        # 所以我们优先判定为 Control
+        return "Control", "#e6ffe6"  # 浅绿色背景
+    # === 修改结束 ===
+
+    if hit_case and not hit_ctrl: return "Case", "#ffe6e6" # 浅红色
+    if hit_ctrl and not hit_case: return "Control", "#e6ffe6" # 浅绿色
+    
     return "Unknown", "grey"
+
+
 
 # --- 差异分析主流程 ---
 
