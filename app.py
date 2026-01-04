@@ -12,11 +12,12 @@ from statsmodels.stats.multitest import multipletests
 import mygene
 from urllib.parse import quote
 from collections import Counter
+from bs4 import BeautifulSoup 
 
 # ==========================================
 # 0. 配置与初始化
 # ==========================================
-st.set_page_config(page_title="GEO Pipeline (Diagnostic Mode)", layout="wide", page_icon="🩺")
+st.set_page_config(page_title="GEO Pipeline (Ultimate Edition)", layout="wide", page_icon="🧬")
 
 WORK_DIR = Path("workspace")
 RAW_DIR = WORK_DIR / "raw"
@@ -71,7 +72,7 @@ def download_file(url, path):
     path = Path(path)
     if path.exists() and path.stat().st_size > 0: return
     try:
-        r = requests.get(url, stream=True, timeout=60)
+        r = requests.get(url, stream=True, timeout=120) # 增加超时时间
         r.raise_for_status()
         with open(path, 'wb') as f:
             for chunk in r.iter_content(chunk_size=1024*1024):
@@ -88,12 +89,13 @@ def get_geo_urls(gse):
     prefix = f"GSE{series_id // 1000}nnn"
     soft_url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{prefix}/{gse}/soft/{gse}_family.soft.gz"
     matrix_url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{prefix}/{gse}/matrix/{gse}_series_matrix.txt.gz"
-    return soft_url, matrix_url
+    suppl_url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{prefix}/{gse}/suppl/"
+    return soft_url, matrix_url, suppl_url
 
 def extract_metadata_only(gse):
     gse_dir = RAW_DIR / gse
     gse_dir.mkdir(exist_ok=True)
-    soft_url, _ = get_geo_urls(gse)
+    soft_url, _, _ = get_geo_urls(gse)
     soft_path = gse_dir / f"{gse}_family.soft.gz"
     try: download_file(soft_url, soft_path)
     except Exception as e: return None, str(e)
@@ -129,185 +131,246 @@ def determine_group(text, case_terms, ctrl_terms):
     if hit_ctrl: return "Control", "#e6ffe6"
     return "Unknown", "grey"
 
+# --- 新增：补充文件处理模块 ---
+
+def find_best_suppl_file(suppl_url):
+    """爬取 suppl 目录，找到最像表达矩阵的文件"""
+    try:
+        r = requests.get(suppl_url, timeout=10)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        files = [a.get('href') for a in soup.find_all('a') if a.get('href')]
+        
+        # 过滤掉非数据文件
+        candidates = []
+        for f in files:
+            f_lower = f.lower()
+            if f_lower.endswith(('.txt.gz', '.tsv.gz', '.csv.gz', '.xls', '.xlsx', '.txt', '.tsv')):
+                # 优先找 counts, fpkm, tpm, expression
+                score = 0
+                if 'count' in f_lower: score += 3
+                if 'fpkm' in f_lower: score += 2
+                if 'tpm' in f_lower: score += 2
+                if 'expression' in f_lower: score += 2
+                if 'raw' in f_lower: score += 1
+                candidates.append((score, f))
+        
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1] if candidates else None
+    except:
+        return None
+
+def normalize_col_name(s):
+    return re.sub(r'[^a-z0-9]', '', str(s).lower())
+
+def try_map_suppl_cols(df, df_meta):
+    """
+    补充文件的列名通常是 Sample Name (如 Control_1)，而不是 GSM。
+    需要通过 Metadata 中的 Title 映射回 GSM。
+    """
+    # 建立 Title -> GSM 的映射字典
+    title_to_gsm = {}
+    for idx, row in df_meta.iterrows():
+        # 标准化 Title
+        norm_title = normalize_col_name(row["Title"])
+        title_to_gsm[norm_title] = row["GSM"]
+    
+    # 尝试重命名 DataFrame 的列
+    new_cols = {}
+    mapped_count = 0
+    
+    for col in df.columns:
+        norm_col = normalize_col_name(col)
+        # 1. 尝试直接匹配 GSM
+        if norm_col.upper().startswith("GSM"):
+            # 提取 GSM
+            m = re.search(r'(GSM\d+)', str(col))
+            if m: 
+                new_cols[col] = m.group(1)
+                mapped_count += 1
+                continue
+
+        # 2. 尝试匹配 Title
+        if norm_col in title_to_gsm:
+            new_cols[col] = title_to_gsm[norm_col]
+            mapped_count += 1
+        else:
+            # 3. 尝试模糊匹配 (列名包含 Title)
+            for t_norm, gsm in title_to_gsm.items():
+                if t_norm in norm_col or norm_col in t_norm:
+                    # 只有当足够长才算匹配，防止匹配到单个数字
+                    if len(t_norm) > 3: 
+                        new_cols[col] = gsm
+                        mapped_count += 1
+                        break
+    
+    if mapped_count >= 2:
+        df = df.rename(columns=new_cols)
+        # 只保留成功映射到 GSM 的列
+        keep_cols = [c for c in df.columns if str(c).startswith("GSM")]
+        return df[keep_cols], f"成功映射 {len(keep_cols)} 列"
+    
+    return df, "列名映射失败"
+
 # --- 深度诊断版：矩阵读取与分析 ---
 
 def run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms):
-    """
-    返回: (df_de, error_message, full_result_df, LOGS_LIST)
-    """
     logs = []
-    def log(msg):
-        timestamp = time.strftime("%H:%M:%S")
-        logs.append(f"[{timestamp}] {msg}")
-
-    log(f"开始处理 {gse}...")
+    def log(msg): logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
     
+    log(f"=== 开始处理 {gse} ===")
     gse_dir = RAW_DIR / gse
     gse_dir.mkdir(exist_ok=True)
-    soft_url, matrix_url = get_geo_urls(gse)
+    soft_url, matrix_url, suppl_url = get_geo_urls(gse)
     soft_path = gse_dir / f"{gse}_family.soft.gz"
     matrix_path = gse_dir / f"{gse}_series_matrix.txt.gz"
     
-    # 1. 下载
-    log("Step 1: 检查文件...")
+    # 1. 下载 Soft
     try:
         download_file(soft_url, soft_path)
-        download_file(matrix_url, matrix_path)
-        log(f"文件就绪。Soft大小: {soft_path.stat().st_size/1024:.1f}KB, Matrix大小: {matrix_path.stat().st_size/1024:.1f}KB")
-    except Exception as e:
-        return None, f"下载失败: {e}", None, logs
+    except:
+        return None, "Soft文件下载失败", None, logs
 
     # 2. 解析元数据
-    log("Step 2: 解析样本分组...")
     df_meta, msg = extract_metadata_only(gse)
     if df_meta is None or df_meta.empty:
-        log(f"Soft解析失败: {msg}")
         return None, "Soft解析失败", None, logs
     
     conditions = {}
     for idx, row in df_meta.iterrows():
         clean_gsm = str(row["GSM"]).strip()
         group, _ = determine_group(row["Full_Description"], case_terms, ctrl_terms)
-        if group in ["Case", "Control"]:
-            conditions[clean_gsm] = group.lower()
+        if group in ["Case", "Control"]: conditions[clean_gsm] = group.lower()
     
-    log(f"分组结果: 找到 {len(conditions)} 个有效样本 (Case/Control)。")
     if not conditions:
-        log("❌ 严重错误: 没有样本被分到 Case 或 Control 组。请检查关键词。")
-        return None, "分组失败: 0样本匹配", None, logs
+        return None, "没有样本匹配到关键词", None, logs
+    log(f"元数据分组: {len(conditions)} 个样本 (Case/Ctrl)")
 
-    # 3. 读取矩阵 (最容易出错的地方)
-    log("Step 3: 读取表达矩阵...")
+    # 3. 尝试读取标准矩阵
+    use_suppl = False
+    df = pd.DataFrame()
+    
+    log("尝试下载标准 Series Matrix...")
     try:
-        # 寻找表头
+        download_file(matrix_url, matrix_path)
+        # 智能读取
         header_row = None
         with gzip.open(matrix_path, 'rt', encoding='utf-8', errors='ignore') as f:
             for i, line in enumerate(f):
-                if i > 2000: break
-                if "!series_matrix_table_begin" in line:
-                    header_row = i + 1
-                    log(f"  -> 在第 {i+1} 行找到 table_begin 标记")
-                    break
-                if line.startswith("\"ID_REF\"") or line.startswith("ID_REF"):
-                    header_row = i
-                    log(f"  -> 在第 {i} 行找到 ID_REF")
+                if i>2000: break
+                if "!series_matrix_table_begin" in line or "\"ID_REF\"" in line or "ID_REF" in line:
+                    header_row = i if "ID_REF" in line else i+1
                     break
         
-        # 读取
         skip = header_row if header_row is not None else "infer"
-        if skip == "infer":
-            df = pd.read_csv(matrix_path, sep="\t", comment="!", index_col=0, on_bad_lines='skip')
+        if skip == "infer": df = pd.read_csv(matrix_path, sep="\t", comment="!", index_col=0, on_bad_lines='skip')
+        else: df = pd.read_csv(matrix_path, sep="\t", skiprows=skip, index_col=0, on_bad_lines='skip')
+        
+        log(f"标准矩阵形状: {df.shape}")
+        
+        # 检查是否为空壳矩阵 (这是关键！)
+        if df.shape[0] < 50 or df.shape[1] < 2:
+            log("⚠️ 检测到矩阵为空或行数过少 (可能是RNA-seq空壳文件)。")
+            use_suppl = True
         else:
-            df = pd.read_csv(matrix_path, sep="\t", skiprows=skip, index_col=0, on_bad_lines='skip')
-        
-        log(f"  -> 原始矩阵形状: {df.shape}")
-        log(f"  -> 原始前5列名: {list(df.columns[:5])}")
-
-        # 清洗列名
-        clean_cols_map = {}
-        for c in df.columns:
-            # 提取 GSM
-            m = re.search(r'(GSM\d+)', str(c))
-            if m: clean_cols_map[c] = m.group(1)
-        
-        if not clean_cols_map:
-            # 尝试另一种策略：也许列名就是 GSM，只是带了引号
+            # 尝试清洗列名
+            clean_map = {}
             for c in df.columns:
-                clean = str(c).strip().replace('"', '').replace("'", "")
-                if clean.startswith("GSM"):
-                    clean_cols_map[c] = clean
-        
-        if not clean_cols_map:
-            log("❌ 矩阵列名解析失败: 无法从列名中提取 GSM ID。")
-            return None, "列名无GSM ID", None, logs
-            
-        df = df.rename(columns=clean_cols_map)
-        # 去重
-        df = df.loc[:, ~df.columns.duplicated()]
-        log(f"  -> 清洗后包含GSM的列数: {len(df.columns)}")
-        
-        # 4. 对齐
-        log("Step 4: 样本对齐...")
-        common = set(df.columns).intersection(set(conditions.keys()))
-        log(f"  -> Matrix中的GSM: {list(df.columns)[:3]}...")
-        log(f"  -> Metadata中的GSM: {list(conditions.keys())[:3]}...")
-        log(f"  -> 交集样本数: {len(common)}")
-        
-        if len(common) < 2:
-            log("❌ 对齐失败: Matrix 和 Metadata 没有足够的共同样本。")
-            return None, "样本对齐失败", None, logs
-            
-        df = df[list(common)]
-        
-        # 5. 数据清洗与转换
-        log("Step 5: 数据数值化检查...")
-        # 强制转数字
-        df = df.apply(pd.to_numeric, errors='coerce')
-        # 删除全是 NaN 的行
-        orig_genes = len(df)
-        df = df.dropna(axis=0, how='all')
-        log(f"  -> 删除了 {orig_genes - len(df)} 行全空基因")
-        
-        if df.empty:
-            log("❌ 错误: 矩阵在转数值后为空。")
-            return None, "矩阵为空", None, logs
-            
-        # Log2 处理
-        max_val = df.max().max()
-        log(f"  -> 矩阵最大值: {max_val:.2f}")
-        if max_val > 50:
-            log("  -> 检测到非Log数据，执行 Log2(x+1) 变换...")
-            df = np.log2(df + 1)
-        
-        # 6. 差异分析
-        log("Step 6: 计算差异表达...")
-        case_cols = [c for c in df.columns if conditions[c] == 'case']
-        ctrl_cols = [c for c in df.columns if conditions[c] == 'control']
-        log(f"  -> 最终分析样本: Case={len(case_cols)}, Control={len(ctrl_cols)}")
-        
-        if len(case_cols) < 2 or len(ctrl_cols) < 2:
-            log("❌ 错误: 有效样本不足 (每组需>=2)。")
-            return None, "样本不足", None, logs
-            
-        # Numpy 计算
-        case_vals = df[case_cols].values
-        ctrl_vals = df[ctrl_cols].values
-        
-        # 方差检查
-        case_var = np.var(case_vals, axis=1)
-        ctrl_var = np.var(ctrl_vals, axis=1)
-        valid_genes_mask = (case_var > 1e-6) | (ctrl_var > 1e-6)
-        log(f"  -> 过滤掉 {len(df) - np.sum(valid_genes_mask)} 个无变化基因")
-        
-        df = df[valid_genes_mask]
-        case_vals = case_vals[valid_genes_mask]
-        ctrl_vals = ctrl_vals[valid_genes_mask]
-        
-        log2fc = np.mean(case_vals, axis=1) - np.mean(ctrl_vals, axis=1)
-        
-        with np.errstate(divide='ignore', invalid='ignore'):
-            tstat, pvals = stats.ttest_ind(case_vals, ctrl_vals, axis=1, equal_var=False)
-        
-        res_df = pd.DataFrame({
-            "gene": df.index,
-            "log2fc": log2fc,
-            "pval": np.nan_to_num(pvals, nan=1.0)
-        })
-        
-        res_df = res_df.dropna(subset=["log2fc"])
-        res_df["padj"] = multipletests(res_df["pval"], method="fdr_bh")[1]
-        res_df = res_df.sort_values("log2fc", key=abs, ascending=False)
-        
-        res_df["gene_symbol"] = res_df["gene"].apply(lambda x: str(x).split("//")[0].split(".")[0].strip().upper())
-        
-        log(f"✅ 分析成功! 得到 {len(res_df)} 个结果行。")
-        return res_df, "Success", res_df, logs
+                m = re.search(r'(GSM\d+)', str(c))
+                if m: clean_map[c] = m.group(1)
+            if clean_map:
+                df = df.rename(columns=clean_map)
+                df = df.loc[:, ~df.columns.duplicated()]
+            else:
+                log("⚠️ 标准矩阵列名不含 GSM，标记为无效。")
+                use_suppl = True
 
     except Exception as e:
-        import traceback
-        log(f"❌ 发生未捕获异常: {str(e)}")
-        log(traceback.format_exc())
-        return None, f"Runtime Error: {str(e)}", None, logs
+        log(f"标准矩阵读取出错: {e}")
+        use_suppl = True
+
+    # 4. 如果标准矩阵不可用，尝试 Supplementary Files
+    if use_suppl:
+        log("🔄 启动备用方案: 抓取 Supplementary Files...")
+        best_file = find_best_suppl_file(suppl_url)
+        if best_file:
+            log(f"找到补充文件: {best_file}")
+            suppl_path = gse_dir / best_file
+            file_url = suppl_url + best_file
+            try:
+                download_file(file_url, suppl_path)
+                # 读取补充文件 (尝试不同的分隔符)
+                if best_file.endswith('.csv.gz') or best_file.endswith('.csv'):
+                    df = pd.read_csv(suppl_path, index_col=0)
+                else:
+                    df = pd.read_csv(suppl_path, sep=None, engine='python', index_col=0) # 自动识别分隔符
+                
+                log(f"补充文件读取成功，形状: {df.shape}")
+                
+                # 映射列名 (Title -> GSM)
+                df, map_msg = try_map_suppl_cols(df, df_meta)
+                log(f"列名映射结果: {map_msg}")
+                
+            except Exception as e:
+                log(f"❌ 补充文件读取失败: {e}")
+                return None, "补充文件读取失败", None, logs
+        else:
+            log("❌ 未找到合适的补充文件。")
+            return None, "无有效矩阵文件", None, logs
+
+    # 5. 对齐与清洗
+    common = set(df.columns).intersection(set(conditions.keys()))
+    log(f"最终对齐样本数: {len(common)}")
+    
+    if len(common) < 2:
+        return None, "样本对齐失败 (Matrix列名与Meta不匹配)", None, logs
+        
+    df = df[list(common)]
+    
+    # 6. 转数值
+    df = df.apply(pd.to_numeric, errors='coerce')
+    df = df.dropna(axis=0, how='all')
+    
+    if df.empty: return None, "矩阵数值化后为空", None, logs
+    
+    # Log2
+    if df.max().max() > 50:
+        log("执行 Log2 转换...")
+        df = np.log2(df + 1)
+    
+    # 7. 差异分析
+    case_cols = [c for c in df.columns if conditions[c] == 'case']
+    ctrl_cols = [c for c in df.columns if conditions[c] == 'control']
+    
+    if len(case_cols) < 2 or len(ctrl_cols) < 2:
+        return None, f"有效样本不足 (Case={len(case_cols)}, Ctrl={len(ctrl_cols)})", None, logs
+        
+    case_vals = df[case_cols].values
+    ctrl_vals = df[ctrl_cols].values
+    
+    # 简单过滤低表达
+    mask = (np.mean(case_vals, axis=1) > 0) | (np.mean(ctrl_vals, axis=1) > 0)
+    df = df[mask]
+    case_vals = case_vals[mask]
+    ctrl_vals = ctrl_vals[mask]
+    
+    log2fc = np.mean(case_vals, axis=1) - np.mean(ctrl_vals, axis=1)
+    
+    with np.errstate(divide='ignore', invalid='ignore'):
+        tstat, pvals = stats.ttest_ind(case_vals, ctrl_vals, axis=1, equal_var=False)
+    
+    res_df = pd.DataFrame({
+        "gene": df.index,
+        "log2fc": log2fc,
+        "pval": np.nan_to_num(pvals, nan=1.0)
+    })
+    
+    res_df = res_df.dropna(subset=["log2fc"])
+    res_df["padj"] = multipletests(res_df["pval"], method="fdr_bh")[1]
+    res_df = res_df.sort_values("log2fc", key=abs, ascending=False)
+    res_df["gene_symbol"] = res_df["gene"].apply(lambda x: str(x).split("//")[0].split(".")[0].strip().upper())
+    
+    log(f"✅ 分析完成，得到 {len(res_df)} 个基因。")
+    return res_df, "Success", res_df, logs
 
 # --- API ---
 def run_l1000fwd(up_genes, dn_genes):
@@ -394,17 +457,15 @@ with tab3:
         for i, gse in enumerate(st.session_state["selected_gses"]):
             with log_container:
                 st.write(f"**Processing {gse}...**")
-                # 使用诊断版 pipeline
                 df_de, msg, full_res, logs = run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms)
                 
                 if df_de is None:
                     st.error(f"❌ {gse} Failed: {msg}")
-                    # === 关键：显示详细日志 ===
                     with st.expander("🔍 查看详细报错日志 (Debug Log)", expanded=True):
                         st.text("\n".join(logs))
                     continue
                 
-                st.success(f"✅ {gse} OK")
+                st.success(f"✅ {gse} OK. Genes: {len(df_de)}")
                 up = df_de[df_de["log2fc"] > 0].head(top_n_genes)["gene_symbol"].tolist()
                 dn = df_de[df_de["log2fc"] < 0].tail(top_n_genes)["gene_symbol"].tolist()
                 
