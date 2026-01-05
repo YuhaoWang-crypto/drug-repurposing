@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 # ==========================================
 # 0. 配置与初始化
 # ==========================================
-st.set_page_config(page_title="GEO Pipeline (Final Fix)", layout="wide", page_icon="🧬")
+st.set_page_config(page_title="GEO Pipeline (Final Robust)", layout="wide", page_icon="🧬")
 
 WORK_DIR = Path("workspace")
 RAW_DIR = WORK_DIR / "raw"
@@ -28,6 +28,9 @@ PROC_DIR.mkdir(parents=True, exist_ok=True)
 if "geo_hits" not in st.session_state: st.session_state["geo_hits"] = pd.DataFrame()
 if "selected_gses" not in st.session_state: st.session_state["selected_gses"] = []
 if "metadata_cache" not in st.session_state: st.session_state["metadata_cache"] = {}
+# 新增：用于存储详细差异分析结果
+if "de_results_cache" not in st.session_state: st.session_state["de_results_cache"] = {}
+if "final_drug_rank" not in st.session_state: st.session_state["final_drug_rank"] = pd.DataFrame()
 
 # ==========================================
 # 1. 核心工具函数
@@ -131,7 +134,7 @@ def determine_group(text, case_terms, ctrl_terms):
     if hit_ctrl: return "Control", "#e6ffe6"
     return "Unknown", "grey"
 
-# --- 补充文件处理模块 (Enhanced) ---
+# --- 补充文件处理 ---
 
 def find_best_suppl_file(suppl_url):
     try:
@@ -143,11 +146,11 @@ def find_best_suppl_file(suppl_url):
             f_lower = f.lower()
             if f_lower.endswith(('.txt.gz', '.tsv.gz', '.csv.gz', '.xls', '.xlsx', '.txt', '.tsv')):
                 score = 0
+                if 'deg' in f_lower: score += 4 # 优先找已经是差异分析结果的文件
+                if 'result' in f_lower: score += 3
                 if 'count' in f_lower: score += 3
                 if 'fpkm' in f_lower: score += 2
                 if 'tpm' in f_lower: score += 2
-                if 'expression' in f_lower: score += 2
-                if 'raw' in f_lower: score += 1
                 candidates.append((score, f))
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1] if candidates else None
@@ -157,17 +160,15 @@ def normalize_str_token(s):
     return re.sub(r'[^a-z0-9]', '', str(s).lower())
 
 def try_map_suppl_cols(df, df_meta, logs):
-    """
-    尝试三种策略映射列名：
-    1. GSM 直接匹配
-    2. Title 模糊匹配
-    3. 强制位置匹配 (如果样本数一致)
-    """
-    
-    # 打印前几个列名供调试
     logs.append(f"  -> 补充文件列名预览 (前5): {list(df.columns[:5])}")
-    logs.append(f"  -> Metadata GSM顺序预览: {df_meta['GSM'].tolist()[:5]}")
     
+    # 策略 0: 检查是否是“成品” DE 结果表 (GSE165718 的情况)
+    # 如果包含 log2FoldChange, PValue 等列，直接不需要映射样本了
+    col_str = " ".join([str(c).lower() for c in df.columns])
+    if "foldchange" in col_str or "logfc" in col_str or "pvalue" in col_str or "padj" in col_str:
+        logs.append("  -> ✅ 检测到文件包含差异分析结果字段 (logFC/Pval)，启用直读模式，跳过样本对齐。")
+        return df, "Pre-calculated DE"
+
     # 策略 1: GSM 匹配
     new_cols = {}
     for col in df.columns:
@@ -179,45 +180,37 @@ def try_map_suppl_cols(df, df_meta, logs):
         df = df.rename(columns=new_cols)
         return df[[c for c in df.columns if c.startswith("GSM")]], "GSM Match"
 
-    # 策略 2: Title 模糊匹配
+    # 策略 2: Title 匹配
     title_to_gsm = {normalize_str_token(row["Title"]): row["GSM"] for _, row in df_meta.iterrows()}
     new_cols = {}
     for col in df.columns:
         norm_col = normalize_str_token(col)
         for t_norm, gsm in title_to_gsm.items():
             if t_norm in norm_col or norm_col in t_norm:
-                if len(t_norm) > 3: # 避免匹配到纯数字
+                if len(t_norm) > 3:
                     new_cols[col] = gsm
                     break
     
     if len(new_cols) >= 2:
         logs.append(f"  -> 策略2成功: Title模糊匹配到 {len(new_cols)} 个")
         df = df.rename(columns=new_cols)
-        # 去重，防止多个列匹配到同一个GSM
         df = df.loc[:, ~df.columns.duplicated()]
         return df[list(new_cols.values())], "Title Fuzzy Match"
 
-    # 策略 3: 强制位置匹配 (Positional Fallback)
-    # 找出 df 中看起来像数据的列（排除 gene id 等）
+    # 策略 3: 强制位置匹配
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    # 如果没识别出数字列，可能是还没转数字，取所有列排除第一列
-    if len(numeric_cols) < 2:
-        numeric_cols = df.columns[1:].tolist()
-    
+    if len(numeric_cols) < 2: numeric_cols = df.columns[1:].tolist()
     meta_gsms = df_meta["GSM"].tolist()
-    
-    logs.append(f"  -> 策略3检查: Meta样本数={len(meta_gsms)}, Matrix数据列数={len(numeric_cols)}")
     
     if len(meta_gsms) == len(numeric_cols):
         logs.append("  -> ⚠️ 启用策略3: 强制按位置对齐 (Positional Mapping)")
-        # 直接按顺序重命名
         rename_map = {old: new for old, new in zip(numeric_cols, meta_gsms)}
         df = df.rename(columns=rename_map)
         return df[meta_gsms], "Positional Force Match"
     
     return df, "Mapping Failed"
 
-# --- 深度诊断版 Pipeline ---
+# --- 核心分析流程 (含“成品直读”逻辑) ---
 
 def run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms):
     logs = []
@@ -230,11 +223,9 @@ def run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms):
     soft_path = gse_dir / f"{gse}_family.soft.gz"
     matrix_path = gse_dir / f"{gse}_series_matrix.txt.gz"
     
-    # 1. 下载 Soft
     try: download_file(soft_url, soft_path)
-    except: return None, "Soft文件下载失败", None, logs
+    except: return None, "Soft下载失败", None, logs
 
-    # 2. 解析元数据
     df_meta, msg = extract_metadata_only(gse)
     if df_meta is None or df_meta.empty: return None, "Soft解析失败", None, logs
     
@@ -244,30 +235,19 @@ def run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms):
         group, _ = determine_group(row["Full_Description"], case_terms, ctrl_terms)
         if group in ["Case", "Control"]: conditions[clean_gsm] = group.lower()
     
-    if not conditions: return None, "没有样本匹配到关键词", None, logs
-    log(f"元数据分组: {len(conditions)} 个样本 (Case/Ctrl)")
+    if not conditions: return None, "无样本匹配到关键词", None, logs
 
-    # 3. 尝试读取标准矩阵
     use_suppl = False
     df = pd.DataFrame()
+    is_precalculated = False
     
-    log("尝试下载标准 Series Matrix...")
+    log("尝试下载标准矩阵...")
     try:
         download_file(matrix_url, matrix_path)
-        header_row = None
-        with gzip.open(matrix_path, 'rt', encoding='utf-8', errors='ignore') as f:
-            for i, line in enumerate(f):
-                if i>2000: break
-                if "!series_matrix_table_begin" in line or "\"ID_REF\"" in line or "ID_REF" in line:
-                    header_row = i if "ID_REF" in line else i+1
-                    break
-        skip = header_row if header_row is not None else "infer"
-        if skip == "infer": df = pd.read_csv(matrix_path, sep="\t", comment="!", index_col=0, on_bad_lines='skip')
-        else: df = pd.read_csv(matrix_path, sep="\t", skiprows=skip, index_col=0, on_bad_lines='skip')
-        
-        log(f"标准矩阵形状: {df.shape}")
+        # 读取检查
+        df = pd.read_csv(matrix_path, sep="\t", comment="!", index_col=0, on_bad_lines='skip')
         if df.shape[0] < 50 or df.shape[1] < 2:
-            log("⚠️ 检测到矩阵为空或行数过少 (可能是RNA-seq空壳文件)。")
+            log("⚠️ 标准矩阵无效 (空壳)。")
             use_suppl = True
         else:
             clean_map = {}
@@ -278,119 +258,139 @@ def run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms):
                 df = df.rename(columns=clean_map)
                 df = df.loc[:, ~df.columns.duplicated()]
             else:
-                log("⚠️ 标准矩阵列名不含 GSM，标记为无效。")
                 use_suppl = True
-    except Exception as e:
-        log(f"标准矩阵读取出错: {e}")
+    except:
         use_suppl = True
 
-    # 4. 补充文件流程
     if use_suppl:
-        log("🔄 启动备用方案: 抓取 Supplementary Files...")
+        log("🔄 抓取补充文件...")
         best_file = find_best_suppl_file(suppl_url)
         if best_file:
-            log(f"找到补充文件: {best_file}")
+            log(f"下载补充文件: {best_file}")
             suppl_path = gse_dir / best_file
-            file_url = suppl_url + best_file
             try:
-                download_file(file_url, suppl_path)
-                # 尝试自动检测分隔符和压缩格式
+                download_file(suppl_url + best_file, suppl_path)
+                # 尝试读取
                 if best_file.endswith('.csv.gz') or best_file.endswith('.csv'):
                     df = pd.read_csv(suppl_path, index_col=0)
                 else:
                     df = pd.read_csv(suppl_path, sep=None, engine='python', index_col=0)
                 
-                log(f"补充文件读取成功，形状: {df.shape}")
+                log(f"读取成功: {df.shape}")
                 
-                # === 关键修复：列名映射 + 强制对齐 ===
+                # 尝试映射
                 df, map_msg = try_map_suppl_cols(df, df_meta, logs)
-                log(f"列名映射结果: {map_msg}")
-                
+                log(f"映射状态: {map_msg}")
+                if map_msg == "Pre-calculated DE":
+                    is_precalculated = True
             except Exception as e:
-                log(f"❌ 补充文件读取失败: {e}")
-                return None, "补充文件读取失败", None, logs
+                return None, f"补充文件错误: {e}", None, logs
         else:
-            log("❌ 未找到合适的补充文件。")
-            return None, "无有效矩阵文件", None, logs
+            return None, "无有效文件", None, logs
 
-    # 5. 对齐
-    common = set(df.columns).intersection(set(conditions.keys()))
-    log(f"最终对齐样本数: {len(common)}")
-    
-    if len(common) < 2:
-        return None, "样本对齐失败 (Matrix列名与Meta不匹配)", None, logs
+    # === 分支：成品数据直读 ===
+    if is_precalculated:
+        log("检测到成品数据，尝试直接提取 logFC 和 Pval...")
+        # 寻找对应的列
+        cols = df.columns
+        lfc_col = next((c for c in cols if "log2foldchange" in c.lower() or "logfc" in c.lower()), None)
+        pval_col = next((c for c in cols if "adj.p" in c.lower() or "padj" in c.lower() or "pvalue" in c.lower()), None)
         
+        if lfc_col:
+            log(f"找到 logFC 列: {lfc_col}")
+            res_df = pd.DataFrame()
+            res_df["gene"] = df.index
+            res_df["log2fc"] = df[lfc_col]
+            if pval_col:
+                res_df["padj"] = df[pval_col]
+                res_df["pval"] = df[pval_col] # 暂用
+            else:
+                res_df["pval"] = 0.05
+                res_df["padj"] = 0.05
+            
+            res_df = res_df.dropna(subset=["log2fc"])
+            res_df["gene_symbol"] = res_df["gene"].apply(lambda x: str(x).split("//")[0].split(".")[0].strip().upper())
+            res_df = res_df.sort_values("log2fc", key=abs, ascending=False)
+            log(f"✅ 提取成功: {len(res_df)} 行")
+            return res_df, "Pre-calculated", res_df, logs
+        else:
+            return None, "未找到 LogFC 列", None, logs
+
+    # === 分支：常规计算 ===
+    common = set(df.columns).intersection(set(conditions.keys()))
+    if len(common) < 2: return None, "样本对齐失败", None, logs
+    
     df = df[list(common)]
+    df = df.apply(pd.to_numeric, errors='coerce').dropna(axis=0, how='all')
+    if df.empty: return None, "矩阵为空", None, logs
     
-    # 6. 转数值
-    df = df.apply(pd.to_numeric, errors='coerce')
-    df = df.dropna(axis=0, how='all')
-    if df.empty: return None, "矩阵数值化后为空", None, logs
-    
-    # Log2
-    if df.max().max() > 50:
-        log("执行 Log2 转换...")
+    if df.max().max() > 50: 
+        log("执行 Log2...")
         df = np.log2(df + 1)
-    
-    # 7. 差异分析
+        
     case_cols = [c for c in df.columns if conditions[c] == 'case']
     ctrl_cols = [c for c in df.columns if conditions[c] == 'control']
     
-    if len(case_cols) < 2 or len(ctrl_cols) < 2:
-        return None, f"有效样本不足 (Case={len(case_cols)}, Ctrl={len(ctrl_cols)})", None, logs
-        
+    if len(case_cols)<2 or len(ctrl_cols)<2: return None, "样本不足", None, logs
+    
     case_vals = df[case_cols].values
     ctrl_vals = df[ctrl_cols].values
-    mask = (np.mean(case_vals, axis=1) > 0) | (np.mean(ctrl_vals, axis=1) > 0)
-    df = df[mask]
-    case_vals = case_vals[mask]
-    ctrl_vals = ctrl_vals[mask]
     
     log2fc = np.mean(case_vals, axis=1) - np.mean(ctrl_vals, axis=1)
     with np.errstate(divide='ignore', invalid='ignore'):
-        tstat, pvals = stats.ttest_ind(case_vals, ctrl_vals, axis=1, equal_var=False)
-    
+        _, pvals = stats.ttest_ind(case_vals, ctrl_vals, axis=1, equal_var=False)
+        
     res_df = pd.DataFrame({"gene": df.index, "log2fc": log2fc, "pval": np.nan_to_num(pvals, nan=1.0)})
     res_df = res_df.dropna(subset=["log2fc"])
     res_df["padj"] = multipletests(res_df["pval"], method="fdr_bh")[1]
     res_df = res_df.sort_values("log2fc", key=abs, ascending=False)
     res_df["gene_symbol"] = res_df["gene"].apply(lambda x: str(x).split("//")[0].split(".")[0].strip().upper())
     
-    log(f"✅ 分析完成，得到 {len(res_df)} 个基因。")
+    log("✅ 计算完成")
     return res_df, "Success", res_df, logs
 
 # --- API ---
-def run_l1000fwd(up_genes, dn_genes):
+def run_l1000fwd(up_genes, dn_genes, logs):
     url = "https://maayanlab.cloud/l1000fwd/sig_search"
-    payload = {"up_genes": up_genes[:150], "down_genes": dn_genes[:150]}
+    # 限制基因数量，防止 API 报错
+    payload = {"up_genes": up_genes[:100], "down_genes": dn_genes[:100]}
     try:
-        r = requests.post(url, json=payload, timeout=30)
+        r = requests.post(url, json=payload, timeout=45)
+        if r.status_code != 200:
+            logs.append(f"L1000 API Error: Status {r.status_code}")
+            return pd.DataFrame()
         res_id = r.json().get("result_id")
-        if not res_id: return pd.DataFrame()
-        time.sleep(1)
-        r2 = requests.get(f"https://maayanlab.cloud/l1000fwd/result/topn/{res_id}", timeout=30)
+        if not res_id:
+            logs.append("L1000 API: No result_id")
+            return pd.DataFrame()
+        time.sleep(2)
+        r2 = requests.get(f"https://maayanlab.cloud/l1000fwd/result/topn/{res_id}", timeout=45)
         data = r2.json()
         rows = []
         if "opposite" in data:
             for item in data["opposite"]:
                 rows.append({"drug": item.get("pert_id"), "score": item.get("score"), "source": "L1000FWD"})
         return pd.DataFrame(rows)
-    except: return pd.DataFrame()
+    except Exception as e:
+        logs.append(f"L1000 Exception: {e}")
+        return pd.DataFrame()
 
-def run_enrichr(genes, library="LINCS_L1000_Chem_Pert_down"):
+def run_enrichr(genes, logs, library="LINCS_L1000_Chem_Pert_down"):
     base = "https://maayanlab.cloud/Enrichr"
     try:
-        r = requests.post(f"{base}/addList", files={'list': (None, '\n'.join(genes[:300])), 'description': (None, 'Streamlit')}, timeout=30)
+        r = requests.post(f"{base}/addList", files={'list': (None, '\n'.join(genes[:300])), 'description': (None, 'Streamlit')}, timeout=45)
         uid = r.json().get("userListId")
         if not uid: return pd.DataFrame()
-        r2 = requests.get(f"{base}/enrich?userListId={uid}&backgroundType={library}", timeout=30)
+        r2 = requests.get(f"{base}/enrich?userListId={uid}&backgroundType={library}", timeout=45)
         data = r2.json()
         if library not in data: return pd.DataFrame()
         rows = []
         for item in data[library]:
             rows.append({"drug": item[1].split("_")[0].split(" ")[0], "score": item[4], "source": "Enrichr"})
         return pd.DataFrame(rows)
-    except: return pd.DataFrame()
+    except Exception as e:
+        logs.append(f"Enrichr Exception: {e}")
+        return pd.DataFrame()
 
 # ==========================================
 # 2. UI
@@ -404,10 +404,10 @@ with st.sidebar:
     case_terms = [x.strip().lower() for x in case_input.split(",") if x.strip()]
     ctrl_terms = [x.strip().lower() for x in ctrl_input.split(",") if x.strip()]
     st.divider()
-    top_n_genes = st.number_input("Top Genes", 50, 500, 150)
+    top_n_genes = st.number_input("Top Genes (Signature)", 50, 500, 100)
     taxon_filter = st.selectbox("Species", ["Homo sapiens", "Mus musculus", "All"], index=0)
 
-tab1, tab2, tab3, tab4 = st.tabs(["1️⃣ 搜索", "2️⃣ 样本调试", "3️⃣ 运行分析", "4️⃣ 结果"])
+tab1, tab2, tab3, tab4 = st.tabs(["1️⃣ 搜索", "2️⃣ 样本调试", "3️⃣ 运行分析", "4️⃣ 结果 & 详情"])
 
 with tab1:
     col1, col2 = st.columns([3, 1])
@@ -446,26 +446,36 @@ with tab3:
                 st.write(f"**Processing {gse}...**")
                 df_de, msg, full_res, logs = run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms)
                 
+                # 无论成功失败，都保存日志
                 if df_de is None:
                     st.error(f"❌ {gse} Failed: {msg}")
-                    with st.expander("🔍 查看详细报错日志 (Debug Log)", expanded=True):
-                        st.text("\n".join(logs))
+                    with st.expander("Debug Log"): st.text("\n".join(logs))
                     continue
                 
+                # 保存详细结果表到 session
+                st.session_state["de_results_cache"][gse] = full_res
+                
                 st.success(f"✅ {gse} OK. Genes: {len(df_de)}")
+                
                 up = df_de[df_de["log2fc"] > 0].head(top_n_genes)["gene_symbol"].tolist()
                 dn = df_de[df_de["log2fc"] < 0].tail(top_n_genes)["gene_symbol"].tolist()
                 
-                if len(up)<5:
-                    st.warning("Not enough genes")
+                if len(up)<10:
+                    st.warning("Skipping drugs (too few genes)")
                     continue
-                    
-                df_l = run_l1000fwd(clean_gene_list(up), clean_gene_list(dn))
-                df_e = run_enrichr(clean_gene_list(up), "LINCS_L1000_Chem_Pert_down")
+                
+                logs.append("正在查询 API...")
+                df_l = run_l1000fwd(clean_gene_list(up), clean_gene_list(dn), logs)
+                df_e = run_enrichr(clean_gene_list(up), logs, "LINCS_L1000_Chem_Pert_down")
+                
                 comb = pd.concat([df_l, df_e])
                 if not comb.empty:
                     comb["gse"] = gse
                     results_bucket.append(comb)
+                else:
+                    st.warning("API返回空结果 (Check Log)")
+                    with st.expander("Debug Log"): st.text("\n".join(logs))
+                    
             progress.progress((i+1)/len(st.session_state["selected_gses"]))
         
         if results_bucket:
@@ -473,8 +483,26 @@ with tab3:
             st.success("Done! See Tab 4")
 
 with tab4:
+    st.subheader("💊 药物分析结果")
     res = st.session_state.get("final_drug_rank", pd.DataFrame())
-    if not res.empty:
-        agg = res.groupby("drug").agg(Count=('gse','nunique'), Score=('score','sum')).reset_index().sort_values("Count", ascending=False)
-        st.dataframe(agg, use_container_width=True)
-        st.download_button("Download", agg.to_csv().encode("utf-8"), "drugs.csv")
+    
+    col_drug, col_de = st.columns([1, 1])
+    
+    with col_drug:
+        st.markdown("#### 1. 药物重定位排序")
+        if not res.empty:
+            agg = res.groupby("drug").agg(Count=('gse','nunique'), Score=('score','sum')).reset_index().sort_values("Count", ascending=False)
+            st.dataframe(agg, use_container_width=True, height=500)
+            st.download_button("Download Drugs", agg.to_csv().encode("utf-8"), "drugs.csv")
+        else:
+            st.info("暂无药物结果")
+
+    with col_de:
+        st.markdown("#### 2. 差异表达详细数据 (查看 pval, logFC)")
+        if st.session_state["de_results_cache"]:
+            view_gse = st.selectbox("选择数据集查看:", list(st.session_state["de_results_cache"].keys()))
+            de_df = st.session_state["de_results_cache"][view_gse]
+            st.dataframe(de_df.head(100), use_container_width=True, height=500)
+            st.download_button(f"Download {view_gse} DE Table", de_df.to_csv().encode("utf-8"), f"{view_gse}_DE.csv")
+        else:
+            st.info("暂无差异分析数据，请先运行 Pipeline")
