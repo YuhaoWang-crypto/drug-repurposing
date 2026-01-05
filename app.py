@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 # ==========================================
 # 0. 配置与初始化
 # ==========================================
-st.set_page_config(page_title="GEO Pipeline (Final & ID Fixed)", layout="wide", page_icon="💊")
+st.set_page_config(page_title="GEO Drug Discovery (Stable)", layout="wide", page_icon="💊")
 
 WORK_DIR = Path("workspace")
 RAW_DIR = WORK_DIR / "raw"
@@ -38,47 +38,74 @@ if "final_drug_rank" not in st.session_state: st.session_state["final_drug_rank"
 @st.cache_resource
 def get_mygene_info(): return mygene.MyGeneInfo()
 
-# --- 核心修复：ID 转换函数 ---
+# --- 药名翻译器 (新增) ---
+@st.cache_data
+def resolve_drug_name(pert_id):
+    """
+    尝试将 BRD-xxx 或其他 ID 转换为通用药名 (通过 PubChem)
+    """
+    pert_id = str(pert_id).strip()
+    # 如果看起来已经像名字(不含数字或横杠)，直接返回
+    if re.match(r'^[A-Za-z\s]+$', pert_id) and len(pert_id) > 3:
+        return pert_id
+    
+    # 尝试 PubChem
+    try:
+        url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{pert_id}/synonyms/JSON"
+        r = requests.get(url, timeout=2)
+        if r.status_code == 200:
+            synonyms = r.json()['InformationList']['Information'][0]['Synonym']
+            # 返回第一个非纯数字的同义词
+            for syn in synonyms:
+                if not re.match(r'^[\d\-\.]+$', syn):
+                    return syn
+    except:
+        pass
+    
+    return pert_id # 翻译失败返回原ID
+
+def clean_gene_list_strict(genes):
+    """
+    严格清洗基因名，防止 API 500 错误
+    """
+    out = []
+    seen = set()
+    for g in genes:
+        if not isinstance(g, str): continue
+        # 1. 转大写
+        g = g.strip().upper()
+        # 2. 去除 Ensembl ID
+        if g.startswith("ENS"): continue
+        # 3. 必须包含字母
+        if not re.search(r'[A-Z]', g): continue
+        # 4. 去除特殊字符 (只允许字母数字和连字符)
+        g = re.sub(r'[^A-Z0-9\-]', '', g)
+        
+        if g and g not in seen:
+            seen.add(g)
+            out.append(g)
+    return out
+
+# --- ID 转换 ---
 def map_ensembl_to_symbol(gene_list, logs):
-    """
-    将 ENSG ID 转换为 Symbol (例如 ENSG00000182378 -> CLCN2)
-    """
-    # 检查是否看起来像 Ensembl ID
     sample = [str(g) for g in gene_list[:10]]
     if not any(x.startswith("ENS") for x in sample):
-        return {g: g for g in gene_list} # 已经是 Symbol，无需转换
+        return {g: g for g in gene_list}
 
-    logs.append("  -> 检测到 Ensembl ID，正在调用 MyGene 进行转换...")
+    logs.append("  -> 正在进行 ID 转换 (Ensembl -> Symbol)...")
     mg = get_mygene_info()
     try:
-        # 批量查询
         res = mg.querymany(gene_list, scopes='ensembl.gene', fields='symbol', species='human', returnall=False, verbose=False)
         mapping = {}
-        success_count = 0
         for item in res:
             query = item.get('query')
             symbol = item.get('symbol')
             if query and symbol:
                 mapping[query] = symbol.upper()
-                success_count += 1
-        
-        logs.append(f"  -> ID 转换成功: {success_count}/{len(gene_list)}")
         return mapping
     except Exception as e:
-        logs.append(f"  -> MyGene ID 转换失败: {e}")
+        logs.append(f"  -> ID转换出错: {e}")
         return {g: g for g in gene_list}
-
-def clean_gene_list(genes):
-    out = []
-    seen = set()
-    for g in genes:
-        if not isinstance(g, str): continue
-        # 这里不再暴力去版本号，保留完整字符交给 mapping 处理
-        g = g.strip().upper()
-        if g and g not in seen:
-            seen.add(g)
-            out.append(g)
-    return out
 
 # --- GEO 下载 ---
 def geo_search(query, retmax=30):
@@ -190,21 +217,22 @@ def normalize_str_token(s):
     return re.sub(r'[^a-z0-9]', '', str(s).lower())
 
 def try_map_suppl_cols(df, df_meta, logs):
-    logs.append(f"  -> 补充文件列名预览 (前5): {list(df.columns[:5])}")
     col_str = " ".join([str(c).lower() for c in df.columns])
     if "foldchange" in col_str or "logfc" in col_str or "pvalue" in col_str or "padj" in col_str:
-        logs.append("  -> ✅ 检测到文件包含差异分析结果字段 (logFC/Pval)，启用直读模式。")
+        logs.append("  -> ✅ 检测到成品 DE 表，直读模式启用。")
         return df, "Pre-calculated DE"
 
+    # 1. GSM Match
     new_cols = {}
     for col in df.columns:
         m = re.search(r'(GSM\d+)', str(col))
         if m: new_cols[col] = m.group(1)
     if len(new_cols) >= 2:
-        logs.append(f"  -> 策略1成功: 匹配到 {len(new_cols)} 个 GSM")
+        logs.append(f"  -> GSM 匹配成功 ({len(new_cols)})")
         df = df.rename(columns=new_cols)
         return df[[c for c in df.columns if c.startswith("GSM")]], "GSM Match"
 
+    # 2. Title Match
     title_to_gsm = {normalize_str_token(row["Title"]): row["GSM"] for _, row in df_meta.iterrows()}
     new_cols = {}
     for col in df.columns:
@@ -215,17 +243,18 @@ def try_map_suppl_cols(df, df_meta, logs):
                     new_cols[col] = gsm
                     break
     if len(new_cols) >= 2:
-        logs.append(f"  -> 策略2成功: Title模糊匹配到 {len(new_cols)} 个")
+        logs.append(f"  -> 标题模糊匹配成功 ({len(new_cols)})")
         df = df.rename(columns=new_cols)
         df = df.loc[:, ~df.columns.duplicated()]
         return df[list(new_cols.values())], "Title Fuzzy Match"
 
+    # 3. Positional
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if len(numeric_cols) < 2: numeric_cols = df.columns[1:].tolist()
     meta_gsms = df_meta["GSM"].tolist()
     
     if len(meta_gsms) == len(numeric_cols):
-        logs.append("  -> ⚠️ 启用策略3: 强制按位置对齐 (Positional Mapping)")
+        logs.append("  -> 位置强制匹配启用")
         rename_map = {old: new for old, new in zip(numeric_cols, meta_gsms)}
         df = df.rename(columns=rename_map)
         return df[meta_gsms], "Positional Force Match"
@@ -238,7 +267,7 @@ def run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms):
     logs = []
     def log(msg): logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
     
-    log(f"=== 开始处理 {gse} ===")
+    log(f"=== {gse} ===")
     gse_dir = RAW_DIR / gse
     gse_dir.mkdir(exist_ok=True)
     soft_url, matrix_url, suppl_url = get_geo_urls(gse)
@@ -257,19 +286,16 @@ def run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms):
         group, _ = determine_group(row["Full_Description"], case_terms, ctrl_terms)
         if group in ["Case", "Control"]: conditions[clean_gsm] = group.lower()
     
-    if not conditions: return None, "无样本匹配到关键词", None, logs
+    if not conditions: return None, "无样本匹配", None, logs
 
     use_suppl = False
     df = pd.DataFrame()
     is_precalculated = False
     
-    log("尝试下载标准矩阵...")
     try:
         download_file(matrix_url, matrix_path)
         df = pd.read_csv(matrix_path, sep="\t", comment="!", index_col=0, on_bad_lines='skip')
-        if df.shape[0] < 50 or df.shape[1] < 2:
-            log("⚠️ 标准矩阵无效 (空壳)。")
-            use_suppl = True
+        if df.shape[0] < 50 or df.shape[1] < 2: use_suppl = True
         else:
             clean_map = {}
             for c in df.columns:
@@ -278,16 +304,14 @@ def run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms):
             if clean_map:
                 df = df.rename(columns=clean_map)
                 df = df.loc[:, ~df.columns.duplicated()]
-            else:
-                use_suppl = True
-    except:
-        use_suppl = True
+            else: use_suppl = True
+    except: use_suppl = True
 
     if use_suppl:
-        log("🔄 抓取补充文件...")
+        log("🔄 启用补充文件...")
         best_file = find_best_suppl_file(suppl_url)
         if best_file:
-            log(f"下载补充文件: {best_file}")
+            log(f"下载: {best_file}")
             suppl_path = gse_dir / best_file
             try:
                 download_file(suppl_url + best_file, suppl_path)
@@ -296,21 +320,14 @@ def run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms):
                 else:
                     df = pd.read_csv(suppl_path, sep=None, engine='python', index_col=0)
                 
-                log(f"读取成功: {df.shape}")
                 df, map_msg = try_map_suppl_cols(df, df_meta, logs)
-                log(f"映射状态: {map_msg}")
-                if map_msg == "Pre-calculated DE":
-                    is_precalculated = True
-            except Exception as e:
-                return None, f"补充文件错误: {e}", None, logs
-        else:
-            return None, "无有效文件", None, logs
+                if map_msg == "Pre-calculated DE": is_precalculated = True
+            except Exception as e: return None, f"补充文件错误: {e}", None, logs
+        else: return None, "无有效文件", None, logs
 
-    # === 生成 res_df ===
     res_df = pd.DataFrame()
 
     if is_precalculated:
-        log("直读模式...")
         cols = df.columns
         lfc_col = next((c for c in cols if "log2foldchange" in c.lower() or "logfc" in c.lower()), None)
         pval_col = next((c for c in cols if "adj.p" in c.lower() or "padj" in c.lower() or "pvalue" in c.lower()), None)
@@ -318,22 +335,14 @@ def run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms):
         if lfc_col:
             res_df["gene"] = df.index
             res_df["log2fc"] = df[lfc_col]
-            if pval_col:
-                res_df["padj"] = df[pval_col]
-                res_df["pval"] = df[pval_col]
-            else:
-                res_df["pval"] = 0.05
-                res_df["padj"] = 0.05
-        else:
-            return None, "未找到 LogFC 列", None, logs
+            res_df["pval"] = df[pval_col] if pval_col else 0.05
+            res_df["padj"] = df[pval_col] if pval_col else 0.05
+        else: return None, "未找到 LogFC 列", None, logs
     else:
-        # 常规计算
         common = set(df.columns).intersection(set(conditions.keys()))
-        if len(common) < 2: return None, "样本对齐失败", None, logs
-        
+        if len(common) < 2: return None, "对齐失败", None, logs
         df = df[list(common)]
         df = df.apply(pd.to_numeric, errors='coerce').dropna(axis=0, how='all')
-        if df.empty: return None, "矩阵为空", None, logs
         if df.max().max() > 50: df = np.log2(df + 1)
             
         case_cols = [c for c in df.columns if conditions[c] == 'case']
@@ -343,7 +352,6 @@ def run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms):
         
         case_vals = df[case_cols].values
         ctrl_vals = df[ctrl_cols].values
-        
         log2fc = np.mean(case_vals, axis=1) - np.mean(ctrl_vals, axis=1)
         with np.errstate(divide='ignore', invalid='ignore'):
             _, pvals = stats.ttest_ind(case_vals, ctrl_vals, axis=1, equal_var=False)
@@ -353,68 +361,87 @@ def run_analysis_pipeline_diagnostic(gse, case_terms, ctrl_terms):
         res_df["pval"] = np.nan_to_num(pvals, nan=1.0)
         res_df["padj"] = multipletests(res_df["pval"], method="fdr_bh")[1]
 
-    # === 关键修复：ID 转换 ===
     res_df = res_df.dropna(subset=["log2fc"])
     res_df = res_df.sort_values("log2fc", key=abs, ascending=False)
     
-    # 1. 先简单清洗（去版本号）
+    # ID 转换
     raw_genes = res_df["gene"].astype(str).apply(lambda x: x.split("//")[0].split(".")[0].strip())
-    
-    # 2. 调用 mapping (Ensembl -> Symbol)
     mapping_dict = map_ensembl_to_symbol(raw_genes.tolist(), logs)
     res_df["gene_symbol"] = raw_genes.map(mapping_dict).fillna(raw_genes).str.upper()
     
-    # 3. 过滤无效 Symbol
+    # 过滤空值
     res_df = res_df[res_df["gene_symbol"] != ""]
     
     log(f"✅ 完成。Symbol 转换后剩余 {len(res_df)} 个基因。")
     return res_df, "Success", res_df, logs
 
-# --- API ---
+# --- API (Enhanced Stability) ---
 def run_l1000fwd(up_genes, dn_genes, logs):
     url = "https://maayanlab.cloud/l1000fwd/sig_search"
-    # L1000 只接受 Symbol，且有长度限制
-    payload = {"up_genes": up_genes[:100], "down_genes": dn_genes[:100]}
+    # 清洗：只保留合法的字符串，去掉ENSG
+    up_clean = clean_gene_list_strict(up_genes)[:100]
+    dn_clean = clean_gene_list_strict(dn_genes)[:100]
     
-    # 简单的重试机制
-    for attempt in range(3):
+    if not up_clean and not dn_clean:
+        logs.append("L1000 跳过: 无有效 Symbol")
+        return pd.DataFrame()
+
+    payload = {"up_genes": up_clean, "down_genes": dn_clean}
+    
+    for attempt in range(2):
         try:
-            r = requests.post(url, json=payload, timeout=45)
+            r = requests.post(url, json=payload, timeout=30)
             if r.status_code == 200:
                 res_id = r.json().get("result_id")
                 if not res_id: return pd.DataFrame()
-                time.sleep(2)
-                r2 = requests.get(f"https://maayanlab.cloud/l1000fwd/result/topn/{res_id}", timeout=45)
+                time.sleep(1)
+                r2 = requests.get(f"https://maayanlab.cloud/l1000fwd/result/topn/{res_id}", timeout=30)
                 data = r2.json()
                 rows = []
                 if "opposite" in data:
                     for item in data["opposite"]:
-                        rows.append({"drug": item.get("pert_id"), "score": item.get("score"), "source": "L1000FWD"})
+                        # 翻译药名
+                        raw_id = item.get("pert_id", "")
+                        name = resolve_drug_name(raw_id)
+                        rows.append({
+                            "drug_id": raw_id,
+                            "drug": name, 
+                            "score": item.get("score"), 
+                            "source": "L1000FWD"
+                        })
                 return pd.DataFrame(rows)
             else:
-                logs.append(f"L1000 Attempt {attempt+1} failed: {r.status_code}")
-                time.sleep(2)
+                logs.append(f"L1000 Attempt {attempt+1} 失败: {r.status_code}")
+                time.sleep(1)
         except Exception as e:
             logs.append(f"L1000 Error: {e}")
-            time.sleep(2)
     return pd.DataFrame()
 
 def run_enrichr(genes, logs, library="LINCS_L1000_Chem_Pert_down"):
     base = "https://maayanlab.cloud/Enrichr"
+    # 清洗
+    clean = clean_gene_list_strict(genes)[:300]
+    if not clean: return pd.DataFrame()
+
     try:
-        r = requests.post(f"{base}/addList", files={'list': (None, '\n'.join(genes[:300])), 'description': (None, 'Streamlit')}, timeout=45)
+        r = requests.post(f"{base}/addList", files={'list': (None, '\n'.join(clean)), 'description': (None, 'Streamlit')}, timeout=30)
         uid = r.json().get("userListId")
         if not uid: return pd.DataFrame()
-        r2 = requests.get(f"{base}/enrich?userListId={uid}&backgroundType={library}", timeout=45)
+        r2 = requests.get(f"{base}/enrich?userListId={uid}&backgroundType={library}", timeout=30)
         data = r2.json()
         if library not in data: return pd.DataFrame()
         rows = []
         for item in data[library]:
-            rows.append({"drug": item[1].split("_")[0].split(" ")[0], "score": item[4], "source": "Enrichr"})
+            # item[1] = "DrugName_CellLine_..."
+            drug_raw = item[1].split("_")[0]
+            rows.append({
+                "drug_id": drug_raw,
+                "drug": drug_raw, # Enrichr 通常已经是名字
+                "score": item[4], 
+                "source": "Enrichr"
+            })
         return pd.DataFrame(rows)
-    except Exception as e:
-        logs.append(f"Enrichr Error: {e}")
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 # ==========================================
 # 2. UI
@@ -476,22 +503,14 @@ with tab3:
                     continue
                 
                 st.session_state["de_results_cache"][gse] = full_res
-                
                 st.success(f"✅ {gse} OK. Genes: {len(df_de)}")
                 
-                # 使用转换后的 Symbol 列
                 up = df_de[df_de["log2fc"] > 0].head(top_n_genes)["gene_symbol"].tolist()
                 dn = df_de[df_de["log2fc"] < 0].tail(top_n_genes)["gene_symbol"].tolist()
                 
-                # 过滤掉空的 Symbol
-                up = [x for x in up if x and not x.startswith("ENS")]
-                dn = [x for x in dn if x and not x.startswith("ENS")]
+                logs.append(f"正在查询 API (Up:{len(up)} Dn:{len(dn)})...")
                 
-                if len(up)<10:
-                    st.warning("Skipping drugs (too few valid symbols)")
-                    continue
-                
-                logs.append("正在查询 API (Sent Symbols)...")
+                # 分开查询，互不影响
                 df_l = run_l1000fwd(up, dn, logs)
                 df_e = run_enrichr(up, logs, "LINCS_L1000_Chem_Pert_down")
                 
@@ -518,18 +537,25 @@ with tab4:
     with col_drug:
         st.markdown("#### 1. 药物重定位排序")
         if not res.empty:
-            agg = res.groupby("drug").agg(Count=('gse','nunique'), Score=('score','sum')).reset_index().sort_values("Count", ascending=False)
-            st.dataframe(agg, use_container_width=True, height=500)
+            # 清洗药名一致性
+            res["drug_norm"] = res["drug"].astype(str).str.lower()
+            agg = res.groupby(["drug", "drug_norm"]).agg(
+                Count=('gse','nunique'), 
+                Sources=('source', lambda x: ",".join(set(x))),
+                Score=('score','sum')
+            ).reset_index().sort_values("Count", ascending=False)
+            
+            st.dataframe(agg[["drug", "Count", "Score", "Sources"]], use_container_width=True, height=600)
             st.download_button("Download Drugs", agg.to_csv().encode("utf-8"), "drugs.csv")
         else:
             st.info("暂无药物结果")
 
     with col_de:
-        st.markdown("#### 2. 差异表达详细数据 (查看 pval, logFC)")
+        st.markdown("#### 2. 差异表达详细数据")
         if st.session_state["de_results_cache"]:
             view_gse = st.selectbox("选择数据集查看:", list(st.session_state["de_results_cache"].keys()))
             de_df = st.session_state["de_results_cache"][view_gse]
-            st.dataframe(de_df.head(100), use_container_width=True, height=500)
+            st.dataframe(de_df.head(100), use_container_width=True, height=600)
             st.download_button(f"Download {view_gse} DE Table", de_df.to_csv().encode("utf-8"), f"{view_gse}_DE.csv")
         else:
-            st.info("暂无差异分析数据，请先运行 Pipeline")
+            st.info("暂无差异分析数据")
